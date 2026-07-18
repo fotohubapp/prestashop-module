@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<module>
+    <name>fotohubai</name>
+    <displayName><![CDATA[FOTOhub AI — Product Image Generation]]></displayName>
+    <version><![CDATA[1.0.0]]></version>
+    <description><![CDATA[Generate AI product photos, remove backgrounds, and bulk-process your catalog with FOTOhub AI.]]></description>
+    <author><![CDATA[FOTOhub]]></author>
+    <tab><![CDATA[administration]]></tab>
+    <is_configurable>1</is_configurable>
+    <need_instance>0</need_instance>
+    <limited_countries></limited_countries>
+</module>

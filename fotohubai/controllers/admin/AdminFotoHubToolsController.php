@@ -1,0 +1,192 @@
+<?php
+/**
+ * FOTOhub AI Creative Tools Controller
+ *
+ * Admin controller for Stability AI creative tools (remove background, upscale, etc).
+ *
+ * @author    FOTOhub <support@fotohub.app>
+ * @copyright 2026 FOTOhub
+ * @license   MIT
+ */
+
+if (!defined('_PS_VERSION_')) {
+    exit;
+}
+
+require_once _PS_MODULE_DIR_ . 'fotohubai/classes/FotoHubStabilityTools.php';
+
+class AdminFotoHubToolsController extends ModuleAdminController
+{
+    public function __construct()
+    {
+        $this->bootstrap = true;
+
+        parent::__construct();
+
+        $this->meta_title = $this->l('FOTOhub AI — Creative Tools');
+    }
+
+    /**
+     * Initialize page content
+     */
+    public function initContent(): void
+    {
+        parent::initContent();
+
+        // Check if API key is configured
+        $module = Module::getInstanceByName('fotohubai');
+        $apiKey = $module->getDecryptedApiKey();
+
+        if (empty($apiKey)) {
+            $this->warnings[] = $this->l('Please configure your FOTOhub API key first.')
+                . ' <a href="' . $this->context->link->getAdminLink('AdminFotoHubConfig') . '">'
+                . $this->l('Go to Configuration') . '</a>';
+        }
+
+        // Handle AJAX requests
+        if (Tools::getValue('ajax') && Tools::getValue('action')) {
+            $action = Tools::getValue('action');
+
+            switch ($action) {
+                case 'processTool':
+                    $this->ajaxProcessProcessTool();
+                    break;
+                default:
+                    header('Content-Type: application/json');
+                    echo json_encode(['error' => 'Unknown action']);
+                    exit;
+            }
+
+            return;
+        }
+
+        // Get available tools
+        $tools = FotoHubStabilityTools::getAvailableTools();
+
+        // Get product list for dropdown
+        $products = Product::getProducts(
+            $this->context->language->id,
+            0,
+            0,
+            'id_product',
+            'ASC',
+            false,
+            true
+        );
+
+        $productList = [];
+        foreach ($products as $product) {
+            $productList[] = [
+                'id_product' => $product['id_product'],
+                'name' => $product['name'],
+            ];
+        }
+
+        $this->context->smarty->assign([
+            'fotohub_tools' => $tools,
+            'fotohub_products' => $productList,
+            'fotohub_tools_url' => $this->context->link->getAdminLink('AdminFotoHubTools'),
+        ]);
+
+        $this->setTemplate('tools.tpl');
+    }
+
+    /**
+     * AJAX: Process a creative tool on an image
+     */
+    public function ajaxProcessProcessTool(): void
+    {
+        header('Content-Type: application/json');
+
+        $idProduct = (int) Tools::getValue('id_product');
+        $toolId = Tools::getValue('tool_id');
+        $image = Tools::getValue('image');
+        $mask = Tools::getValue('mask');
+        $prompt = Tools::getValue('prompt', '');
+        $options = Tools::getValue('options', '{}');
+
+        if (empty($toolId)) {
+            echo json_encode(['error' => 'No tool specified']);
+            exit;
+        }
+
+        $module = Module::getInstanceByName('fotohubai');
+        $apiKey = $module->getDecryptedApiKey();
+
+        if (empty($apiKey)) {
+            echo json_encode(['error' => 'API key not configured']);
+            exit;
+        }
+
+        // Parse options JSON
+        $parsedOptions = json_decode($options, true) ?: [];
+
+        if (!empty($prompt)) {
+            $parsedOptions['prompt'] = $prompt;
+        }
+
+        if (!empty($mask)) {
+            $parsedOptions['mask'] = $mask;
+        }
+
+        try {
+            $stabilityTools = new FotoHubStabilityTools($apiKey);
+
+            if ($idProduct) {
+                // Process product image
+                $result = $stabilityTools->processProductImage($idProduct, $toolId, $parsedOptions);
+            } elseif (!empty($image)) {
+                // Process uploaded image — save base64 to tmp file
+                $tmpFile = tempnam(sys_get_temp_dir(), 'fotohub_');
+                $imageData = base64_decode($image);
+                file_put_contents($tmpFile, $imageData);
+
+                try {
+                    $result = $stabilityTools->processFromUpload($tmpFile, $toolId, $parsedOptions);
+                } finally {
+                    @unlink($tmpFile);
+                }
+            } else {
+                echo json_encode(['error' => 'No product or image provided']);
+                exit;
+            }
+
+            echo json_encode([
+                'success' => true,
+                'result_url' => $result['image_url'] ?? null,
+                'result_base64' => $result['base64'] ?? null,
+            ]);
+        } catch (Exception $e) {
+            echo json_encode(['error' => $e->getMessage()]);
+        }
+
+        exit;
+    }
+
+    /**
+     * Set the admin template directory
+     */
+    public function setMedia($isNewTheme = false): bool
+    {
+        parent::setMedia($isNewTheme);
+
+        $this->addCSS(_PS_MODULE_DIR_ . 'fotohubai/views/css/admin.css');
+
+        return true;
+    }
+
+    /**
+     * Override template directory to point to module views
+     */
+    public function setTemplate($template, $params = [], $locale = null): void
+    {
+        if (file_exists(_PS_MODULE_DIR_ . 'fotohubai/views/templates/admin/' . $template)) {
+            $this->context->smarty->assign('module_template_dir', _PS_MODULE_DIR_ . 'fotohubai/views/templates/admin/');
+            parent::setTemplate(
+                _PS_MODULE_DIR_ . 'fotohubai/views/templates/admin/' . $template
+            );
+        } else {
+            parent::setTemplate($template, $params, $locale);
+        }
+    }
+}
