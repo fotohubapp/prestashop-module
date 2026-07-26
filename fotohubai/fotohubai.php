@@ -12,6 +12,10 @@ if (!defined('_PS_VERSION_')) {
 }
 
 require_once dirname(__FILE__) . '/classes/FotoHubApiClient.php';
+require_once dirname(__FILE__) . '/classes/FotoHubBridgeClient.php';
+require_once dirname(__FILE__) . '/classes/FotoHubWriteback.php';
+require_once dirname(__FILE__) . '/classes/FotoHubProductWriter.php';
+require_once dirname(__FILE__) . '/classes/FotoHubDraft.php';
 require_once dirname(__FILE__) . '/classes/FotoHubBulkProcessor.php';
 require_once dirname(__FILE__) . '/classes/FotoHubVideoGenerator.php';
 require_once dirname(__FILE__) . '/classes/FotoHubStabilityTools.php';
@@ -21,11 +25,14 @@ require_once dirname(__FILE__) . '/classes/FotoHubScheduler.php';
 
 class FotoHubAi extends Module
 {
+    /** @var array Install error collection */
+    public array $installErrors = [];
+
     public function __construct()
     {
         $this->name = 'fotohubai';
         $this->tab = 'administration';
-        $this->version = '2.0.0';
+        $this->version = '2.1.0';
         $this->author = 'FOTOhub';
         $this->need_instance = 0;
         $this->ps_versions_compliancy = ['min' => '8.0.0', 'max' => _PS_VERSION_];
@@ -34,70 +41,137 @@ class FotoHubAi extends Module
         parent::__construct();
 
         $this->displayName = $this->l('FOTOhub AI — Creative Suite for PrestaShop');
-        $this->description = $this->l('Complete AI creative toolkit: generate product photos & videos, remove backgrounds, upscale images, use 13 Stability AI tools, AI copywriting, and scheduled batch processing.');
+        $this->description = $this->l('Complete AI creative toolkit: generate product photos & videos, remove backgrounds, upscale images, use 13 Stability AI tools, AI copywriting, draft-first review, and scheduled batch processing.');
         $this->confirmUninstall = $this->l('Are you sure you want to uninstall FOTOhub AI? Your API key and settings will be removed.');
     }
 
     /**
-     * Module installation
+     * Module installation — stepwise with error collection instead of one
+     * opaque && chain. Every failed step is recorded in $this->_errors so
+     * the merchant sees exactly what broke.
      */
     public function install(): bool
     {
-        return parent::install()
-            && $this->registerHook('displayAdminProductsExtra')
-            && $this->registerHook('actionAdminProductsControllerSaveAfter')
-            && $this->registerHook('displayBackOfficeHeader')
-            && $this->registerHook('actionProductAdd')
-            && $this->registerHook('actionObjectCombinationAddAfter')
-            && $this->registerHook('displayAdminProductsMainStepLeftColumnMiddle')
-            && $this->installTab('AdminFotoHubConfig', 'FOTOhub AI', 'AdminParentModulesSf')
-            && $this->installTab('AdminFotoHubBulk', 'Bulk Processing', 'AdminFotoHubConfig')
-            && $this->installTab('AdminFotoHubVideo', 'Video Generation', 'AdminFotoHubConfig')
-            && $this->installTab('AdminFotoHubTools', 'Creative Tools', 'AdminFotoHubConfig')
-            && $this->installTab('AdminFotoHubCopy', 'AI Copywriter', 'AdminFotoHubConfig')
-            && $this->installTab('AdminFotoHubAnalytics', 'Analytics', 'AdminFotoHubConfig')
-            && Configuration::updateValue('FOTOHUBAI_API_KEY', '')
-            && Configuration::updateValue('FOTOHUBAI_DEFAULT_MODEL', 'seedream-5-0-260128')
-            && Configuration::updateValue('FOTOHUBAI_DEFAULT_WIDTH', 1024)
-            && Configuration::updateValue('FOTOHUBAI_DEFAULT_HEIGHT', 1024)
-            && Configuration::updateValue('FOTOHUBAI_AUTO_GENERATE', 0)
-            && Configuration::updateValue('FOTOHUBAI_DEFAULT_VIDEO_MODEL', 'veo-2')
-            && Configuration::updateValue('FOTOHUBAI_DEFAULT_CHAT_MODEL', 'gemini-flash')
-            && Configuration::updateValue('FOTOHUBAI_COPYWRITER_TONE', 'professional')
-            && Configuration::updateValue('FOTOHUBAI_COPYWRITER_LANGUAGE', '')
-            && Configuration::updateValue('FOTOHUBAI_SCHEDULER_BATCH_SIZE', 5)
-            && Configuration::updateValue('FOTOHUBAI_SCHEDULER_ENABLED', 0)
-            && Configuration::updateValue('FOTOHUBAI_AUTO_COPYWRITE', 0)
-            && FotoHubAnalytics::install()
-            && FotoHubScheduler::install();
+        $this->installErrors = [];
+
+        if (!parent::install()) {
+            $this->installErrors[] = 'Core module registration failed';
+            return false;
+        }
+
+        $steps = [
+            'hook displayAdminProductsExtra' => fn () => $this->registerHook('displayAdminProductsExtra'),
+            'hook actionAdminProductsControllerSaveAfter' => fn () => $this->registerHook('actionAdminProductsControllerSaveAfter'),
+            'hook displayBackOfficeHeader' => fn () => $this->registerHook('displayBackOfficeHeader'),
+            'hook actionProductAdd' => fn () => $this->registerHook('actionProductAdd'),
+            'hook actionObjectCombinationAddAfter' => fn () => $this->registerHook('actionObjectCombinationAddAfter'),
+            'hook displayAdminProductsMainStepLeftColumnMiddle' => fn () => $this->registerHook('displayAdminProductsMainStepLeftColumnMiddle'),
+            'tab AdminFotoHubConfig' => fn () => $this->installTab('AdminFotoHubConfig', 'FOTOhub AI', 'AdminParentModulesSf'),
+            'tab AdminFotoHubBulk' => fn () => $this->installTab('AdminFotoHubBulk', 'Bulk Processing', 'AdminFotoHubConfig'),
+            'tab AdminFotohubDrafts' => fn () => $this->installTab('AdminFotohubDrafts', 'Drafts Review', 'AdminFotoHubConfig'),
+            'tab AdminFotoHubVideo' => fn () => $this->installTab('AdminFotoHubVideo', 'Video Generation', 'AdminFotoHubConfig'),
+            'tab AdminFotoHubTools' => fn () => $this->installTab('AdminFotoHubTools', 'Creative Tools', 'AdminFotoHubConfig'),
+            'tab AdminFotoHubCopy' => fn () => $this->installTab('AdminFotoHubCopy', 'AI Copywriter', 'AdminFotoHubConfig'),
+            'tab AdminFotoHubAnalytics' => fn () => $this->installTab('AdminFotoHubAnalytics', 'Analytics', 'AdminFotoHubConfig'),
+            'table fotohub_analytics' => fn () => FotoHubAnalytics::install(),
+            'table fotohub_schedule' => fn () => FotoHubScheduler::install(),
+            'table fotohub_draft' => fn () => FotoHubDraft::install(),
+        ];
+
+        $configDefaults = [
+            'FOTOHUBAI_API_KEY' => '',
+            'FOTOHUBAI_KEY_ENCRYPTED' => 0,
+            'FOTOHUBAI_DEFAULT_MODEL' => 'seedream-5-0-260128',
+            'FOTOHUBAI_DEFAULT_WIDTH' => 1024,
+            'FOTOHUBAI_DEFAULT_HEIGHT' => 1024,
+            'FOTOHUBAI_AUTO_GENERATE' => 0,
+            'FOTOHUBAI_DEFAULT_VIDEO_MODEL' => 'veo-3.1-fast-generate-001',
+            'FOTOHUBAI_DEFAULT_CHAT_MODEL' => 'gemini-flash',
+            'FOTOHUBAI_COPYWRITER_TONE' => 'professional',
+            'FOTOHUBAI_COPYWRITER_LANGUAGE' => '',
+            'FOTOHUBAI_SCHEDULER_BATCH_SIZE' => 5,
+            'FOTOHUBAI_SCHEDULER_ENABLED' => 0,
+            'FOTOHUBAI_AUTO_COPYWRITE' => 0,
+            'FOTOHUBAI_DEFAULT_PRESET' => '',
+            'FOTOHUBAI_BRIDGE_CONNECTION_ID' => '',
+            'FOTOHUBAI_BRIDGE_CALLBACK_SECRET' => '',
+            'FOTOHUBAI_BRIDGE_JOBS' => '',
+            'FOTOHUBAI_PRESET_CACHE' => '',
+        ];
+
+        foreach ($configDefaults as $key => $value) {
+            $steps['config ' . $key] = fn () => Configuration::updateValue($key, $value);
+        }
+
+        $success = true;
+
+        foreach ($steps as $label => $step) {
+            try {
+                if (!$step()) {
+                    $this->installErrors[] = $label;
+                    $success = false;
+                }
+            } catch (Exception $e) {
+                $this->installErrors[] = $label . ': ' . $e->getMessage();
+                $success = false;
+            }
+        }
+
+        if (!$success) {
+            $this->_errors[] = $this->l('FOTOhub AI install completed with errors: ')
+                . implode('; ', $this->installErrors);
+        }
+
+        return $success;
     }
 
     /**
-     * Module uninstallation
+     * Module uninstallation — stepwise, best effort, reports failures
      */
     public function uninstall(): bool
     {
-        return parent::uninstall()
-            && $this->uninstallTab('AdminFotoHubConfig')
-            && $this->uninstallTab('AdminFotoHubBulk')
-            && $this->uninstallTab('AdminFotoHubVideo')
-            && $this->uninstallTab('AdminFotoHubTools')
-            && $this->uninstallTab('AdminFotoHubCopy')
-            && $this->uninstallTab('AdminFotoHubAnalytics')
-            && Configuration::deleteByName('FOTOHUBAI_API_KEY')
-            && Configuration::deleteByName('FOTOHUBAI_DEFAULT_MODEL')
-            && Configuration::deleteByName('FOTOHUBAI_DEFAULT_WIDTH')
-            && Configuration::deleteByName('FOTOHUBAI_DEFAULT_HEIGHT')
-            && Configuration::deleteByName('FOTOHUBAI_AUTO_GENERATE')
-            && Configuration::deleteByName('FOTOHUBAI_DEFAULT_VIDEO_MODEL')
-            && Configuration::deleteByName('FOTOHUBAI_DEFAULT_CHAT_MODEL')
-            && Configuration::deleteByName('FOTOHUBAI_COPYWRITER_TONE')
-            && Configuration::deleteByName('FOTOHUBAI_COPYWRITER_LANGUAGE')
-            && Configuration::deleteByName('FOTOHUBAI_SCHEDULER_BATCH_SIZE')
-            && Configuration::deleteByName('FOTOHUBAI_SCHEDULER_ENABLED')
-            && Configuration::deleteByName('FOTOHUBAI_AUTO_COPYWRITE')
-            && FotoHubAnalytics::uninstall()
-            && FotoHubScheduler::uninstall();
+        $success = parent::uninstall();
+
+        $tabs = [
+            'AdminFotoHubConfig', 'AdminFotoHubBulk', 'AdminFotohubDrafts',
+            'AdminFotoHubVideo', 'AdminFotoHubTools', 'AdminFotoHubCopy',
+            'AdminFotoHubAnalytics',
+        ];
+
+        foreach ($tabs as $tab) {
+            if (!$this->uninstallTab($tab)) {
+                $success = false;
+            }
+        }
+
+        $configKeys = [
+            'FOTOHUBAI_API_KEY', 'FOTOHUBAI_KEY_ENCRYPTED', 'FOTOHUBAI_DEFAULT_MODEL',
+            'FOTOHUBAI_DEFAULT_WIDTH', 'FOTOHUBAI_DEFAULT_HEIGHT', 'FOTOHUBAI_AUTO_GENERATE',
+            'FOTOHUBAI_DEFAULT_VIDEO_MODEL', 'FOTOHUBAI_DEFAULT_CHAT_MODEL',
+            'FOTOHUBAI_COPYWRITER_TONE', 'FOTOHUBAI_COPYWRITER_LANGUAGE',
+            'FOTOHUBAI_SCHEDULER_BATCH_SIZE', 'FOTOHUBAI_SCHEDULER_ENABLED',
+            'FOTOHUBAI_AUTO_COPYWRITE', 'FOTOHUBAI_DEFAULT_PRESET',
+            'FOTOHUBAI_BRIDGE_CONNECTION_ID', 'FOTOHUBAI_BRIDGE_CALLBACK_SECRET',
+            'FOTOHUBAI_BRIDGE_JOBS', 'FOTOHUBAI_PRESET_CACHE',
+        ];
+
+        foreach ($configKeys as $key) {
+            Configuration::deleteByName($key);
+        }
+
+        if (!FotoHubAnalytics::uninstall()) {
+            $success = false;
+        }
+
+        if (!FotoHubScheduler::uninstall()) {
+            $success = false;
+        }
+
+        if (!FotoHubDraft::uninstall()) {
+            $success = false;
+        }
+
+        return $success;
     }
 
     /**
@@ -105,6 +179,11 @@ class FotoHubAi extends Module
      */
     private function installTab(string $className, string $tabName, string $parent): bool
     {
+        // Idempotent: skip if the tab already exists (e.g. upgrade re-run)
+        if ((int) Tab::getIdFromClassName($className)) {
+            return true;
+        }
+
         $tab = new Tab();
         $tab->active = 1;
         $tab->class_name = $className;
@@ -117,7 +196,7 @@ class FotoHubAi extends Module
         $tab->id_parent = (int) Tab::getIdFromClassName($parent);
         $tab->module = $this->name;
 
-        return $tab->add();
+        return (bool) $tab->add();
     }
 
     /**
@@ -129,7 +208,7 @@ class FotoHubAi extends Module
 
         if ($idTab) {
             $tab = new Tab($idTab);
-            return $tab->delete();
+            return (bool) $tab->delete();
         }
 
         return true;
@@ -140,8 +219,41 @@ class FotoHubAi extends Module
      */
     public function getContent(): string
     {
+        // Assign the documented configure-page Smarty vars before redirecting,
+        // so themes/templates hooking the configure view can rely on them.
+        $this->assignConfigureSmartyVars();
+
         Tools::redirectAdmin($this->context->link->getAdminLink('AdminFotoHubConfig'));
         return '';
+    }
+
+    /**
+     * Assign the three documented configure Smarty vars:
+     * $fotohub_configured, $fotohub_credits, $fotohub_plan
+     */
+    public function assignConfigureSmartyVars(): void
+    {
+        $apiKey = $this->getDecryptedApiKey();
+        $configured = !empty($apiKey);
+        $credits = null;
+        $plan = null;
+
+        if ($configured) {
+            try {
+                $client = new FotoHubApiClient($apiKey);
+                $balance = $client->getBalance();
+                $credits = $client->getCreditsAvailable();
+                $plan = $balance['tier'] ?? null;
+            } catch (Exception $e) {
+                // Leave nulls — page still renders
+            }
+        }
+
+        $this->context->smarty->assign([
+            'fotohub_configured' => $configured,
+            'fotohub_credits' => $credits,
+            'fotohub_plan' => $plan,
+        ]);
     }
 
     /**
@@ -175,6 +287,8 @@ class FotoHubAi extends Module
             'fotohub_default_model' => Configuration::get('FOTOHUBAI_DEFAULT_MODEL'),
             'fotohub_default_width' => (int) Configuration::get('FOTOHUBAI_DEFAULT_WIDTH'),
             'fotohub_default_height' => (int) Configuration::get('FOTOHUBAI_DEFAULT_HEIGHT'),
+            // getAdminLink() already appends &token=<controller token>, which
+            // AdminFotoHubConfigController::processAjax() verifies (CSRF).
             'fotohub_generate_url' => $this->context->link->getAdminLink('AdminFotoHubConfig') . '&ajax=1&action=generate',
             'fotohub_module_path' => $this->_path,
         ]);
@@ -183,7 +297,7 @@ class FotoHubAi extends Module
     }
 
     /**
-     * Hook: After product save — auto-generate if enabled
+     * Hook: After product save — auto-generate if enabled (draft-first)
      */
     public function hookActionAdminProductsControllerSaveAfter(array $params): void
     {
@@ -222,7 +336,10 @@ class FotoHubAi extends Module
             ]);
 
             if (!empty($result['image_url'])) {
-                $this->addImageToProduct($idProduct, $result['image_url']);
+                // DRAFT-FIRST: never write to the live product silently
+                FotoHubDraft::add($idProduct, FotoHubDraft::TYPE_IMAGE, [
+                    'image_urls' => [$result['image_url']],
+                ], null, 'image_generate');
             }
         } catch (Exception $e) {
             PrestaShopLogger::addLog(
@@ -243,11 +360,14 @@ class FotoHubAi extends Module
         $parts = [];
 
         if (!empty($product->name)) {
-            $parts[] = $product->name;
+            $parts[] = is_array($product->name) ? reset($product->name) : $product->name;
         }
 
         if (!empty($product->description_short)) {
-            $parts[] = strip_tags($product->description_short);
+            $shortDesc = is_array($product->description_short)
+                ? reset($product->description_short)
+                : $product->description_short;
+            $parts[] = strip_tags((string) $shortDesc);
         }
 
         $categories = $product->getCategories();
@@ -271,89 +391,87 @@ class FotoHubAi extends Module
     }
 
     /**
-     * Download and add an image to a product
+     * Download and add an image to a product (delegates to the shared
+     * write-back service; kept public for backward compatibility).
+     *
+     * NOTE: this writes to the LIVE product. Normal AI output must go through
+     * FotoHubDraft and be approved first — see FotoHubDraft::approve().
      */
-    public function addImageToProduct(int $idProduct, string $imageUrl): bool
+    public function addImageToProduct(int $idProduct, string $imageUrl, int $idProductAttribute = 0): bool
     {
-        $product = new Product($idProduct);
+        $writer = new FotoHubWriteback((int) $this->context->language->id);
 
-        $image = new Image();
-        $image->id_product = $idProduct;
-        $image->position = Image::getHighestPosition($idProduct) + 1;
-
-        // Set as cover if no other images exist
-        $existingImages = Image::getImages($this->context->language->id, $idProduct);
-        $image->cover = empty($existingImages) ? 1 : 0;
-
-        if (!$image->add()) {
-            return false;
-        }
-
-        // Download image and copy to PrestaShop image directory
-        $tmpFile = _PS_TMP_IMG_DIR_ . 'fotohub_' . $idProduct . '_' . $image->id . '.jpg';
-        $imageContent = Tools::file_get_contents($imageUrl);
-
-        if (empty($imageContent)) {
-            $image->delete();
-            return false;
-        }
-
-        file_put_contents($tmpFile, $imageContent);
-
-        $newPath = $image->getPathForCreation();
-
-        if (!ImageManager::resize($tmpFile, $newPath . '.jpg')) {
-            $image->delete();
-            @unlink($tmpFile);
-            return false;
-        }
-
-        // Generate thumbnails for all image types
-        $imageTypes = ImageType::getImagesTypes('products');
-        foreach ($imageTypes as $imageType) {
-            ImageManager::resize(
-                $tmpFile,
-                $newPath . '-' . stripslashes($imageType['name']) . '.jpg',
-                (int) $imageType['width'],
-                (int) $imageType['height']
-            );
-        }
-
-        @unlink($tmpFile);
-
-        return true;
+        return $writer->addImageToProduct($idProduct, $imageUrl, $idProductAttribute);
     }
 
     /**
-     * Get decrypted API key
+     * Get decrypted API key.
+     *
+     * Uses the FOTOHUBAI_KEY_ENCRYPTED configuration flag written at save
+     * time instead of the old strlen(>64) heuristic, which misclassified
+     * long plaintext keys and short encrypted blobs.
      */
     public function getDecryptedApiKey(): string
     {
-        $encrypted = Configuration::get('FOTOHUBAI_API_KEY');
+        $stored = Configuration::get('FOTOHUBAI_API_KEY');
 
-        if (empty($encrypted)) {
+        if (empty($stored)) {
             return '';
         }
 
-        // PrestaShop stores Configuration values with cookie encryption if available
-        // For additional security, we use openssl if the key was stored encrypted
-        if (function_exists('openssl_decrypt') && strlen($encrypted) > 64) {
-            $key = _COOKIE_KEY_;
-            $decoded = base64_decode($encrypted);
-            if ($decoded === false) {
-                return $encrypted;
-            }
-            $iv = substr($decoded, 0, 16);
-            $ciphertext = substr($decoded, 16);
-            $decrypted = openssl_decrypt($ciphertext, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv);
-            return $decrypted !== false ? $decrypted : $encrypted;
+        if (!Configuration::get('FOTOHUBAI_KEY_ENCRYPTED')) {
+            // Stored as plaintext (openssl unavailable at save time, or legacy)
+            return $stored;
         }
 
-        return $encrypted;
+        if (!function_exists('openssl_decrypt')) {
+            return $stored;
+        }
+
+        $decoded = base64_decode($stored, true);
+
+        if ($decoded === false || strlen($decoded) <= 16) {
+            return $stored;
+        }
+
+        $iv = substr($decoded, 0, 16);
+        $ciphertext = substr($decoded, 16);
+        $decrypted = openssl_decrypt($ciphertext, 'aes-256-cbc', _COOKIE_KEY_, OPENSSL_RAW_DATA, $iv);
+
+        return $decrypted !== false ? $decrypted : $stored;
     }
 
     /**
-     * Encrypt and store API key
+     * Encrypt and store the API key, recording whether encryption was applied
+     * in FOTOHUBAI_KEY_ENCRYPTED so decryption never has to guess.
+     *
+     * @param string $apiKey Plaintext API key
+     * @return bool True on success
+     */
+    public static function storeApiKey(string $apiKey): bool
+    {
+        if (empty($apiKey)) {
+            return Configuration::updateValue('FOTOHUBAI_API_KEY', '')
+                && Configuration::updateValue('FOTOHUBAI_KEY_ENCRYPTED', 0);
+        }
+
+        if (function_exists('openssl_encrypt')) {
+            $iv = openssl_random_pseudo_bytes(16);
+            $ciphertext = openssl_encrypt($apiKey, 'aes-256-cbc', _COOKIE_KEY_, OPENSSL_RAW_DATA, $iv);
+
+            if ($ciphertext !== false) {
+                return Configuration::updateValue('FOTOHUBAI_API_KEY', base64_encode($iv . $ciphertext))
+                    && Configuration::updateValue('FOTOHUBAI_KEY_ENCRYPTED', 1);
+            }
+        }
+
+        return Configuration::updateValue('FOTOHUBAI_API_KEY', $apiKey)
+            && Configuration::updateValue('FOTOHUBAI_KEY_ENCRYPTED', 0);
+    }
+
+    /**
+     * Encrypt an API key (legacy helper — prefer storeApiKey(), which also
+     * records the encryption flag).
      */
     public static function encryptApiKey(string $apiKey): string
     {
@@ -362,11 +480,16 @@ class FotoHubAi extends Module
         }
 
         if (function_exists('openssl_encrypt')) {
-            $key = _COOKIE_KEY_;
             $iv = openssl_random_pseudo_bytes(16);
-            $ciphertext = openssl_encrypt($apiKey, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv);
-            return base64_encode($iv . $ciphertext);
+            $ciphertext = openssl_encrypt($apiKey, 'aes-256-cbc', _COOKIE_KEY_, OPENSSL_RAW_DATA, $iv);
+
+            if ($ciphertext !== false) {
+                Configuration::updateValue('FOTOHUBAI_KEY_ENCRYPTED', 1);
+                return base64_encode($iv . $ciphertext);
+            }
         }
+
+        Configuration::updateValue('FOTOHUBAI_KEY_ENCRYPTED', 0);
 
         return $apiKey;
     }
@@ -380,7 +503,9 @@ class FotoHubAi extends Module
             return;
         }
         $idProduct = (int) ($params['id_product'] ?? ($params['product']->id ?? 0));
-        if (!$idProduct) return;
+        if (!$idProduct) {
+            return;
+        }
 
         // Queue for scheduled processing instead of immediate
         if (Configuration::get('FOTOHUBAI_SCHEDULER_ENABLED')) {
@@ -397,9 +522,11 @@ class FotoHubAi extends Module
             return;
         }
 
-        // Immediate generation (existing pattern from hookActionAdminProductsControllerSaveAfter)
+        // Immediate generation → pending draft
         $apiKey = $this->getDecryptedApiKey();
-        if (empty($apiKey)) return;
+        if (empty($apiKey)) {
+            return;
+        }
 
         $client = new FotoHubApiClient($apiKey);
         $product = new Product($idProduct, false, $this->context->language->id);
@@ -412,8 +539,10 @@ class FotoHubAi extends Module
                 'height' => (int) Configuration::get('FOTOHUBAI_DEFAULT_HEIGHT'),
             ]);
             if (!empty($result['image_url'])) {
-                $this->addImageToProduct($idProduct, $result['image_url']);
-                FotoHubAnalytics::logApiCall($idProduct, 'generate', Configuration::get('FOTOHUBAI_DEFAULT_MODEL'), 0, 'success');
+                FotoHubDraft::add($idProduct, FotoHubDraft::TYPE_IMAGE, [
+                    'image_urls' => [$result['image_url']],
+                ], null, 'image_generate');
+                FotoHubAnalytics::logApiCall($idProduct, 'generate', Configuration::get('FOTOHUBAI_DEFAULT_MODEL'), (float) ($result['credits_used'] ?? 0), 'success');
             }
         } catch (Exception $e) {
             FotoHubAnalytics::logApiCall($idProduct, 'generate', Configuration::get('FOTOHUBAI_DEFAULT_MODEL'), 0, 'failed', ['error' => $e->getMessage()]);
@@ -430,10 +559,14 @@ class FotoHubAi extends Module
             return;
         }
         $combination = $params['object'] ?? null;
-        if (!$combination || !($combination instanceof Combination)) return;
+        if (!$combination || !($combination instanceof Combination)) {
+            return;
+        }
 
         $idProduct = (int) $combination->id_product;
-        if (!$idProduct) return;
+        if (!$idProduct) {
+            return;
+        }
 
         if (Configuration::get('FOTOHUBAI_SCHEDULER_ENABLED')) {
             FotoHubScheduler::enqueue($idProduct, 'generate', [
@@ -449,10 +582,14 @@ class FotoHubAi extends Module
     public function hookDisplayAdminProductsMainStepLeftColumnMiddle(array $params): string
     {
         $idProduct = (int) ($params['id_product'] ?? Tools::getValue('id_product'));
-        if (!$idProduct) return '';
+        if (!$idProduct) {
+            return '';
+        }
 
         $apiKey = $this->getDecryptedApiKey();
-        if (empty($apiKey)) return '';
+        if (empty($apiKey)) {
+            return '';
+        }
 
         $client = new FotoHubApiClient($apiKey);
         $videoGen = new FotoHubVideoGenerator($client, $this->context->language->id);
@@ -469,7 +606,8 @@ class FotoHubAi extends Module
     }
 
     /**
-     * Cron task entry point — called by PrestaShop cron module
+     * Cron task entry point — called by PrestaShop cron module.
+     * Polls bridge jobs and processes the local queue.
      */
     public function cronTask(): void
     {

@@ -53,7 +53,7 @@
             </p>
         {/if}
 
-        <a href="{$fotohub_video_url|escape:'htmlall':'UTF-8'}&id_product={$fotohub_product_id}" class="btn btn-primary btn-sm">
+        <a href="{$fotohub_video_url|escape:'htmlall':'UTF-8'}&id_product={$fotohub_product_id|intval}" class="btn btn-primary btn-sm">
             <i class="material-icons">add_circle</i>
             {l s='Generate Video' mod='fotohubai'}
         </a>

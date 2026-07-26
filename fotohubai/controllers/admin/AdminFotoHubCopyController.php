@@ -13,6 +13,9 @@ if (!defined('_PS_VERSION_')) {
     exit;
 }
 
+require_once _PS_MODULE_DIR_ . 'fotohubai/classes/FotoHubApiClient.php';
+require_once _PS_MODULE_DIR_ . 'fotohubai/classes/FotoHubBridgeClient.php';
+require_once _PS_MODULE_DIR_ . 'fotohubai/classes/FotoHubWriteback.php';
 require_once _PS_MODULE_DIR_ . 'fotohubai/classes/FotoHubCopywriter.php';
 
 class AdminFotoHubCopyController extends ModuleAdminController
@@ -88,8 +91,11 @@ class AdminFotoHubCopyController extends ModuleAdminController
         // Get available languages
         $languages = Language::getLanguages(true);
 
-        // Get available tones
-        $tones = FotoHubCopywriter::getTones();
+        // Get available tones (getSupportedTones() is an instance method)
+        $tones = !empty($apiKey)
+            ? (new FotoHubCopywriter(new FotoHubApiClient($apiKey), (int) $this->context->language->id))
+                ->getSupportedTones()
+            : FotoHubBridgeClient::TONES;
 
         // Content types
         $contentTypes = [
@@ -140,7 +146,7 @@ class AdminFotoHubCopyController extends ModuleAdminController
         }
 
         try {
-            $copywriter = new FotoHubCopywriter($apiKey);
+            $copywriter = new FotoHubCopywriter(new FotoHubApiClient($apiKey), (int) $this->context->language->id);
 
             $options = [
                 'tone' => $tone,
@@ -162,19 +168,19 @@ class AdminFotoHubCopyController extends ModuleAdminController
                     $content = $copywriter->generateShortDescription($idProduct, $options);
                     break;
                 case 'bullets':
-                    $content = $copywriter->generateBullets($idProduct, $options);
+                    // generateBulletPoints() takes a count and returns an array
+                    $content = $this->bulletsToHtml(
+                        $copywriter->generateBulletPoints($idProduct, (int) ($options['count'] ?? 5))
+                    );
                     break;
                 case 'social_facebook':
-                    $options['platform'] = 'facebook';
-                    $content = $copywriter->generateSocialPost($idProduct, $options);
+                    $content = $copywriter->generateSocialCaption($idProduct, 'facebook');
                     break;
                 case 'social_instagram':
-                    $options['platform'] = 'instagram';
-                    $content = $copywriter->generateSocialPost($idProduct, $options);
+                    $content = $copywriter->generateSocialCaption($idProduct, 'instagram');
                     break;
                 case 'social_pinterest':
-                    $options['platform'] = 'pinterest';
-                    $content = $copywriter->generateSocialPost($idProduct, $options);
+                    $content = $copywriter->generateSocialCaption($idProduct, 'pinterest');
                     break;
                 default:
                     echo json_encode(['error' => 'Invalid content type']);
@@ -193,38 +199,57 @@ class AdminFotoHubCopyController extends ModuleAdminController
     }
 
     /**
-     * AJAX: Apply generated content to a product
+     * AJAX: Apply generated content to a product.
+     *
+     * This writes to a LIVE product, so it verifies the admin token and the
+     * edit permission before touching anything.
      */
     public function ajaxProcessApply(): void
     {
         header('Content-Type: application/json');
 
-        $idProduct = (int) Tools::getValue('id_product');
-        $field = Tools::getValue('field');
-        $content = Tools::getValue('content');
+        $token = Tools::getValue('token');
 
-        if (!$idProduct || empty($field) || empty($content)) {
-            echo json_encode(['error' => 'Missing required parameters (id_product, field, content)']);
+        if (!is_string($token) || !hash_equals((string) $this->token, $token)) {
+            http_response_code(403);
+            echo json_encode(['error' => 'Invalid security token']);
             exit;
         }
 
-        $module = Module::getInstanceByName('fotohubai');
-        $apiKey = $module->getDecryptedApiKey();
+        if (!Access::isGranted(
+            'ROLE_MOD_TAB_' . strtoupper($this->controller_name) . '_UPDATE',
+            $this->context->employee->id_profile
+        )) {
+            http_response_code(403);
+            echo json_encode(['error' => 'Insufficient permission']);
+            exit;
+        }
 
-        if (empty($apiKey)) {
-            echo json_encode(['error' => 'API key not configured']);
+        $idProduct = (int) Tools::getValue('id_product');
+        $field = (string) Tools::getValue('field');
+        $content = (string) Tools::getValue('content');
+
+        $allowedFields = ['description', 'description_short', 'meta_description', 'meta_title'];
+
+        if ($idProduct <= 0 || !in_array($field, $allowedFields, true) || $content === '') {
+            http_response_code(400);
+            echo json_encode(['error' => 'Missing or invalid parameters (id_product, field, content)']);
             exit;
         }
 
         try {
-            $result = FotoHubCopywriter::applyToProduct($idProduct, $field, $content);
+            // applyToProduct() is an instance method on the copywriter, which
+            // delegates to the shared FotoHubWriteback service.
+            $writer = new FotoHubWriteback((int) $this->context->language->id);
 
-            if ($result) {
+            if ($writer->applyField($idProduct, $field, $content)) {
                 echo json_encode(['success' => true]);
             } else {
+                http_response_code(500);
                 echo json_encode(['error' => 'Failed to apply content to product']);
             }
         } catch (Exception $e) {
+            http_response_code(500);
             echo json_encode(['error' => $e->getMessage()]);
         }
 
@@ -258,7 +283,7 @@ class AdminFotoHubCopyController extends ModuleAdminController
         $parsedOptions = json_decode($options, true) ?: [];
 
         try {
-            $copywriter = new FotoHubCopywriter($apiKey);
+            $copywriter = new FotoHubCopywriter(new FotoHubApiClient($apiKey), (int) $this->context->language->id);
             $results = [];
 
             foreach ($productIds as $idProduct) {
@@ -276,7 +301,9 @@ class AdminFotoHubCopyController extends ModuleAdminController
                             $content = $copywriter->generateShortDescription($idProduct, $parsedOptions);
                             break;
                         case 'bullets':
-                            $content = $copywriter->generateBullets($idProduct, $parsedOptions);
+                            $content = $this->bulletsToHtml(
+                                $copywriter->generateBulletPoints($idProduct, (int) ($parsedOptions['count'] ?? 5))
+                            );
                             break;
                         default:
                             $content = $copywriter->generateDescription($idProduct, $parsedOptions);
@@ -310,6 +337,30 @@ class AdminFotoHubCopyController extends ModuleAdminController
     /**
      * Set the admin template directory
      */
+    /**
+     * Render an array of bullet points as an HTML list.
+     *
+     * The strings come from the AI, so they are escaped before being wrapped
+     * in markup — this content is later written into a product description.
+     *
+     * @param array $bullets Bullet point strings
+     * @return string HTML <ul> markup, or an empty string when there is nothing
+     */
+    private function bulletsToHtml(array $bullets): string
+    {
+        $items = '';
+
+        foreach ($bullets as $bullet) {
+            if (!is_string($bullet) || trim($bullet) === '') {
+                continue;
+            }
+
+            $items .= '<li>' . htmlspecialchars(trim($bullet), ENT_QUOTES, 'UTF-8') . '</li>';
+        }
+
+        return $items === '' ? '' : '<ul>' . $items . '</ul>';
+    }
+
     public function setMedia($isNewTheme = false): bool
     {
         parent::setMedia($isNewTheme);

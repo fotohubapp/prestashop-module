@@ -15,6 +15,8 @@ if (!defined('_PS_VERSION_')) {
     exit;
 }
 
+require_once dirname(__FILE__) . '/FotoHubDraft.php';
+
 class FotoHubStabilityTools
 {
     private FotoHubApiClient $client;
@@ -134,10 +136,29 @@ class FotoHubStabilityTools
 
         $result = $this->client->stabilityTool($toolId, $imageBase64, $options);
 
-        // Save result to product if image data is returned
+        // DRAFT-FIRST: the result is queued for review in AdminFotohubDrafts.
+        // It used to be written straight onto the live product, which silently
+        // published un-reviewed AI output into the catalogue.
         if (!empty($result['image_url']) || !empty($result['image'])) {
-            $imageData = $result['image_url'] ?? $result['image'];
-            $this->saveResultToProduct($idProduct, $imageData);
+            $imageData = (string) ($result['image_url'] ?? $result['image']);
+
+            try {
+                $result['draft_id'] = FotoHubDraft::add(
+                    $idProduct,
+                    FotoHubDraft::TYPE_IMAGE,
+                    ['image_urls' => [$imageData]],
+                    null,
+                    'image_edit'
+                );
+            } catch (Exception $e) {
+                PrestaShopLogger::addLog(
+                    'FOTOhub Stability: could not store draft — ' . $e->getMessage(),
+                    3,
+                    null,
+                    'Product',
+                    $idProduct
+                );
+            }
         }
 
         return $result;
@@ -402,31 +423,40 @@ class FotoHubStabilityTools
     }
 
     /**
-     * Save a processed image result back to the product
+     * Queue a processed image as a pending draft for the given product.
+     *
+     * This replaces the old saveResultToProduct(), which wrote straight to the
+     * live catalogue. Approval in AdminFotohubDrafts is now the only path from
+     * a Stability result to a live product image.
      *
      * @param int $idProduct Product ID
-     * @param string $imageBase64OrUrl Base64 image data or URL of the processed image
-     * @return bool True on success
+     * @param string $imageBase64OrUrl data: URI or URL of the processed image
+     * @return int Draft ID, or 0 when nothing was stored
      */
-    private function saveResultToProduct(int $idProduct, string $imageBase64OrUrl): bool
+    public function queueResultAsDraft(int $idProduct, string $imageBase64OrUrl): int
     {
+        if ($idProduct <= 0 || $imageBase64OrUrl === '') {
+            return 0;
+        }
+
         try {
-            $module = Module::getInstanceByName('fotohubai');
-
-            if ($module === false) {
-                return false;
-            }
-
-            return $module->addImageToProduct($idProduct, $imageBase64OrUrl);
+            return FotoHubDraft::add(
+                $idProduct,
+                FotoHubDraft::TYPE_IMAGE,
+                ['image_urls' => [$imageBase64OrUrl]],
+                null,
+                'image_edit'
+            );
         } catch (Exception $e) {
             PrestaShopLogger::addLog(
-                'FOTOhub Stability: Failed to save result to product — ' . $e->getMessage(),
+                'FOTOhub Stability: Failed to queue result as draft — ' . $e->getMessage(),
                 3,
                 null,
                 'Product',
                 $idProduct
             );
-            return false;
+
+            return 0;
         }
     }
 }

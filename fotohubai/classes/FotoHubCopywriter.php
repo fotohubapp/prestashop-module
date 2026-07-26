@@ -262,21 +262,9 @@ class FotoHubCopywriter
      */
     public function applyToProduct(int $idProduct, string $field, string $content): bool
     {
-        $allowedFields = ['description', 'description_short', 'meta_description', 'meta_title'];
+        $writer = new FotoHubWriteback($this->idLang);
 
-        if (!in_array($field, $allowedFields, true)) {
-            throw new PrestaShopException('FOTOhub Copywriter: Invalid field "' . $field . '". Allowed: ' . implode(', ', $allowedFields));
-        }
-
-        $product = new Product($idProduct, false, $this->idLang);
-
-        if (!Validate::isLoadedObject($product)) {
-            throw new PrestaShopException('FOTOhub Copywriter: Product not found (ID: ' . $idProduct . ')');
-        }
-
-        $product->{$field}[$this->idLang] = $content;
-
-        return $product->save();
+        return $writer->applyField($idProduct, $field, $content);
     }
 
     /**

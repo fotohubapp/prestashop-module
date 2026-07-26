@@ -33,9 +33,18 @@ class AdminFotoHubAnalyticsController extends ModuleAdminController
     {
         parent::initContent();
 
-        // Handle AJAX requests
+        // Handle AJAX requests. Both branches expose credit-spend history, so
+        // the admin token (CSRF) and the controller's view permission are
+        // required — an authenticated employee session alone is not enough.
         if (Tools::getValue('ajax') && Tools::getValue('action')) {
             $action = Tools::getValue('action');
+
+            if (!$this->verifyRequestToken() || !$this->canView()) {
+                header('Content-Type: application/json');
+                http_response_code(403);
+                echo json_encode(['error' => 'Forbidden']);
+                exit;
+            }
 
             switch ($action) {
                 case 'getChartData':
@@ -46,6 +55,7 @@ class AdminFotoHubAnalyticsController extends ModuleAdminController
                     break;
                 default:
                     header('Content-Type: application/json');
+                    http_response_code(400);
                     echo json_encode(['error' => 'Unknown action']);
                     exit;
             }
@@ -71,9 +81,36 @@ class AdminFotoHubAnalyticsController extends ModuleAdminController
             'fotohub_daily_usage' => json_encode($dailyUsage),
             'fotohub_recent_activity' => $recentActivity,
             'fotohub_analytics_url' => $this->context->link->getAdminLink('AdminFotoHubAnalytics'),
+            // The AJAX endpoints verify this token explicitly (CSRF).
+            'fotohub_token' => $this->token,
         ]);
 
         $this->setTemplate('analytics.tpl');
+    }
+
+    /**
+     * Verify the admin CSRF token for the current request
+     */
+    private function verifyRequestToken(): bool
+    {
+        $token = Tools::getValue('token');
+
+        if (!is_string($token) || $token === '') {
+            return false;
+        }
+
+        return hash_equals((string) $this->token, $token);
+    }
+
+    /**
+     * Does the employee hold the view permission on this controller?
+     */
+    private function canView(): bool
+    {
+        return (bool) Access::isGranted(
+            'ROLE_MOD_TAB_' . strtoupper($this->controller_name) . '_READ',
+            $this->context->employee->id_profile
+        );
     }
 
     /**

@@ -77,11 +77,25 @@ This module uses the FOTOhub API. Full documentation:
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/images/generate` | Generate image from prompt |
+| `POST /v1/ai/generate/image` | Generate image from prompt |
+| `POST /v1/ai/edit/image` | Edit image (inpaint, outpaint, bgswap, upscale) |
 | `POST /v1/images/remove-background` | Remove image background |
-| `POST /v1/images/upscale` | Upscale image resolution |
-| `GET /v1/account/balance` | Check credit balance |
+| `POST /v1/ai/analyze/image` | Analyse image (labels, caption, OCR) |
+| `POST /v1/ai/chat/completions` | Product descriptions and copy |
+| `GET /v1/billing/balance` | Check credit balance |
 | `GET /v1/models` | List available models |
+
+Bulk work goes through the Commerce Bridge instead of these per-item calls:
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/commerce/connections` | Register this store |
+| `POST /v1/commerce/jobs` | Submit a bulk job |
+| `GET /v1/commerce/jobs/{id}` | Poll job progress |
+| `GET /v1/commerce/jobs/{id}/items` | Fetch per-item results |
+| `POST /v1/commerce/jobs/{id}/retry-failed` | Requeue failed items |
+| `GET /v1/commerce/presets` | Preset library |
+| `POST /v1/commerce/estimate` | Cost preflight |
 
 ## Requirements
 

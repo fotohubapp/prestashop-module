@@ -2,10 +2,18 @@
 /**
  * FOTOhub Bulk Processor for PrestaShop
  *
- * Handles batch processing of product images:
- * - Generate AI photos for multiple products
- * - Remove backgrounds in bulk
- * - Upscale product images in bulk
+ * Two execution paths:
+ *
+ * 1. BRIDGE (preferred): submits bulk jobs to the FOTOhub commerce-bridge
+ *    (POST /v1/commerce/jobs) with full product_context. Job IDs persist in
+ *    Configuration so progress survives page reloads; polling happens in
+ *    FotoHubScheduler::processCron. Completed item results land as pending
+ *    drafts (fotohub_draft) — nothing is written to live products until
+ *    the merchant approves in AdminFotohubDrafts.
+ *
+ * 2. LOCAL (fallback): the original resumable synchronous pipeline against
+ *    the direct api-server endpoints, kept for single-store sync ops or when
+ *    the bridge is unavailable. Results also land as drafts.
  *
  * @author    FOTOhub <support@fotohub.app>
  * @copyright 2026 FOTOhub
@@ -18,6 +26,12 @@ if (!defined('_PS_VERSION_')) {
 
 class FotoHubBulkProcessor
 {
+    /** Configuration key holding the JSON list of active bridge jobs */
+    public const CONFIG_ACTIVE_JOBS = 'FOTOHUBAI_BRIDGE_JOBS';
+
+    /** Bridge job states that mean "still running" */
+    private const RUNNING_STATES = ['queued', 'processing', 'awaiting_credits'];
+
     private FotoHubApiClient $client;
     private int $idLang;
 
@@ -34,7 +48,7 @@ class FotoHubBulkProcessor
     private string $batchId = '';
 
     /**
-     * @param FotoHubApiClient $client API client instance
+     * @param FotoHubApiClient $client API client instance (FotoHubBridgeClient enables bridge ops)
      * @param int $idLang Language ID for product data
      */
     public function __construct(FotoHubApiClient $client, int $idLang)
@@ -43,11 +57,535 @@ class FotoHubBulkProcessor
         $this->idLang = $idLang;
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Bridge path
+    // ──────────────────────────────────────────────────────────────────────────
+
     /**
-     * Process a batch of products with the specified action
+     * Submit a bulk job to the commerce-bridge.
+     *
+     * @param array $productIds Product IDs to process
+     * @param string $kind Bridge job kind (see FotoHubBridgeClient::JOB_KINDS)
+     * @param array $options Job options (language, tone, num_images, ...)
+     * @param string|null $model Image model ID
+     * @param string|null $presetSlug Preset slug
+     * @return array Bridge response {job_id, status, total_items, estimated_credits}
+     * @throws FotoHubInsufficientCreditsException
+     * @throws PrestaShopException
+     */
+    public function submitBridgeJob(
+        array $productIds,
+        string $kind,
+        array $options = [],
+        ?string $model = null,
+        ?string $presetSlug = null,
+        bool $perVariant = false
+    ): array {
+        if (!($this->client instanceof FotoHubBridgeClient)) {
+            throw new PrestaShopException('FOTOhub Bulk: Bridge jobs require a FotoHubBridgeClient instance');
+        }
+
+        $items = $this->buildBridgeItems($productIds, $kind, $perVariant);
+
+        if (empty($items)) {
+            throw new PrestaShopException('FOTOhub Bulk: No valid products for this job');
+        }
+
+        // Idempotency key must cover every input that changes the output, so a
+        // re-submit with different options is not silently deduplicated by the
+        // bridge into the first job's result.
+        $fingerprint = implode(',', array_map('intval', $productIds))
+            . '|' . $kind
+            . '|' . ($model ?? '')
+            . '|' . ($presetSlug ?? '')
+            . '|' . ($perVariant ? 'variants' : 'products')
+            . '|' . json_encode($options)
+            . '|' . date('YmdH');
+
+        $idempotencyKey = 'ps-' . md5($fingerprint);
+
+        $response = $this->client->createJob($kind, $items, $options, $model, $presetSlug, $idempotencyKey);
+
+        if (!empty($response['job_id'])) {
+            self::rememberJob((string) $response['job_id'], $kind, count($items));
+        }
+
+        return $response;
+    }
+
+    /**
+     * Build bridge job items with real product_context.
+     *
+     * With $perVariant the iteration is over product combinations: one item per
+     * combination, external_id "<id_product>:<id_product_attribute>", the
+     * combination attributes merged into product_context.attributes, and the
+     * combination's own image (when it has one) as source_image_url. On
+     * approval the resulting draft is associated back to that combination.
+     *
+     * @param array $productIds Product IDs
+     * @param string $kind Job kind (image kinds attach source_image_url)
+     * @param bool $perVariant Emit one item per combination instead of per product
+     * @return array Items ready for POST /jobs
+     */
+    public function buildBridgeItems(array $productIds, string $kind, bool $perVariant = false): array
+    {
+        $needsSourceImage = in_array($kind, ['image_edit', 'bg_remove', 'bg_replace', 'upscale', 'recolor'], true);
+        $items = [];
+
+        foreach ($productIds as $idProduct) {
+            $idProduct = (int) $idProduct;
+            $product = new Product($idProduct, false, $this->idLang);
+
+            if (!Validate::isLoadedObject($product)) {
+                continue;
+            }
+
+            $baseContext = $this->buildProductContext($product);
+            $productImageUrl = $this->getCoverImageUrl($idProduct);
+
+            $combinations = $perVariant ? $this->getCombinations($idProduct) : [];
+
+            if ($perVariant && !empty($combinations)) {
+                foreach ($combinations as $combination) {
+                    $idProductAttribute = (int) $combination['id_product_attribute'];
+                    $context = $baseContext;
+
+                    if (!empty($combination['attributes'])) {
+                        $context['attributes'] = array_merge(
+                            $context['attributes'] ?? [],
+                            $combination['attributes']
+                        );
+                    }
+
+                    if (!empty($combination['title_suffix'])) {
+                        $context['title'] = $baseContext['title'] . ' — ' . $combination['title_suffix'];
+                    }
+
+                    if (isset($combination['price'])) {
+                        $context['price'] = (float) $combination['price'];
+                    }
+
+                    $item = [
+                        'external_id' => $idProduct . ':' . $idProductAttribute,
+                        'variant_id' => (string) $idProductAttribute,
+                        'product_context' => $context,
+                    ];
+
+                    $sku = !empty($combination['reference']) ? $combination['reference'] : $product->reference;
+
+                    if (!empty($sku)) {
+                        $item['sku'] = $sku;
+                    }
+
+                    $sourceUrl = !empty($combination['image_url']) ? $combination['image_url'] : $productImageUrl;
+
+                    if (!empty($sourceUrl)) {
+                        $item['source_image_url'] = $sourceUrl;
+                    } elseif ($needsSourceImage) {
+                        continue;
+                    }
+
+                    $items[] = $item;
+                }
+
+                continue;
+            }
+
+            $item = [
+                'external_id' => (string) $idProduct,
+                'product_context' => $baseContext,
+            ];
+
+            if (!empty($product->reference)) {
+                $item['sku'] = $product->reference;
+            }
+
+            if (!empty($productImageUrl)) {
+                $item['source_image_url'] = $productImageUrl;
+            } elseif ($needsSourceImage) {
+                // Image-transform kinds are pointless without a source image
+                continue;
+            }
+
+            $items[] = $item;
+        }
+
+        return $items;
+    }
+
+    /**
+     * Load a product's combinations with attribute labels and their own image.
+     *
+     * @param int $idProduct Product ID
+     * @return array [{id_product_attribute, reference, price, attributes, title_suffix, image_url}]
+     */
+    public function getCombinations(int $idProduct): array
+    {
+        $product = new Product($idProduct, false, $this->idLang);
+
+        if (!Validate::isLoadedObject($product)) {
+            return [];
+        }
+
+        $rows = $product->getAttributeCombinations($this->idLang);
+
+        if (!is_array($rows) || empty($rows)) {
+            return [];
+        }
+
+        $combinations = [];
+
+        // getAttributeCombinations() returns one row per attribute, so group
+        // the rows back into one entry per combination.
+        foreach ($rows as $row) {
+            $idProductAttribute = (int) $row['id_product_attribute'];
+
+            if (!isset($combinations[$idProductAttribute])) {
+                $combinations[$idProductAttribute] = [
+                    'id_product_attribute' => $idProductAttribute,
+                    'reference' => $row['reference'] ?? '',
+                    'price' => Product::getPriceStatic($idProduct, true, $idProductAttribute, 2),
+                    'attributes' => [],
+                    'title_suffix' => '',
+                    'image_url' => $this->getCombinationImageUrl($idProduct, $idProductAttribute),
+                ];
+            }
+
+            $groupName = $row['group_name'] ?? ($row['group'] ?? '');
+            $attributeName = $row['attribute_name'] ?? '';
+
+            if ($groupName !== '' && $attributeName !== '') {
+                $combinations[$idProductAttribute]['attributes'][$groupName] = $attributeName;
+            }
+        }
+
+        foreach ($combinations as &$combination) {
+            $combination['title_suffix'] = implode(' ', array_values($combination['attributes']));
+        }
+        unset($combination);
+
+        return array_values($combinations);
+    }
+
+    /**
+     * Public URL of a combination's own image, empty when it has none
+     */
+    public function getCombinationImageUrl(int $idProduct, int $idProductAttribute): string
+    {
+        $idImage = (int) Db::getInstance()->getValue(
+            'SELECT `id_image` FROM `' . _DB_PREFIX_ . 'product_attribute_image`
+             WHERE `id_product_attribute` = ' . (int) $idProductAttribute . '
+             LIMIT 1'
+        );
+
+        if ($idImage <= 0) {
+            return '';
+        }
+
+        return $this->buildImageUrl($idProduct, $idImage);
+    }
+
+    /**
+     * Build the bridge product_context object from a loaded product
+     */
+    public function buildProductContext(Product $product): array
+    {
+        $name = is_array($product->name) ? ($product->name[$this->idLang] ?? reset($product->name)) : $product->name;
+
+        $context = [
+            'title' => (string) $name,
+        ];
+
+        // Category
+        $idDefaultCategory = (int) $product->id_category_default;
+        if ($idDefaultCategory > 0) {
+            $category = new Category($idDefaultCategory, $this->idLang);
+            if (Validate::isLoadedObject($category)) {
+                $catName = is_array($category->name) ? ($category->name[$this->idLang] ?? '') : $category->name;
+                if (!empty($catName)) {
+                    $context['category'] = $catName;
+                }
+            }
+        }
+
+        // Attributes from product features
+        $attributes = [];
+        $features = $product->getFrontFeatures($this->idLang);
+        if (!empty($features)) {
+            foreach ($features as $feature) {
+                if (!empty($feature['name'])) {
+                    $attributes[$feature['name']] = $feature['value'] ?? '';
+                }
+            }
+        }
+
+        if ((int) $product->id_manufacturer > 0) {
+            $mfr = new Manufacturer((int) $product->id_manufacturer, $this->idLang);
+            if (Validate::isLoadedObject($mfr) && !empty($mfr->name)) {
+                $attributes['brand'] = $mfr->name;
+            }
+        }
+
+        if (!empty($attributes)) {
+            $context['attributes'] = $attributes;
+        }
+
+        // Price
+        $price = Product::getPriceStatic($product->id, true, null, 2);
+        if ($price !== null) {
+            $context['price'] = (float) $price;
+        }
+
+        // Current description
+        $description = is_array($product->description)
+            ? ($product->description[$this->idLang] ?? '')
+            : $product->description;
+
+        if (!empty($description)) {
+            $context['current_description'] = strip_tags($description);
+        }
+
+        return $context;
+    }
+
+    /**
+     * Persist a job ID so progress survives page reloads
+     */
+    public static function rememberJob(string $jobId, string $kind, int $totalItems = 0): void
+    {
+        $jobs = self::getActiveJobs();
+        $jobs[$jobId] = [
+            'job_id' => $jobId,
+            'kind' => $kind,
+            'created_at' => date('Y-m-d H:i:s'),
+            'status' => 'queued',
+            'total_items' => $totalItems,
+            'done_items' => 0,
+            'failed_items' => 0,
+        ];
+
+        Configuration::updateValue(self::CONFIG_ACTIVE_JOBS, json_encode($jobs));
+    }
+
+    /**
+     * Get all tracked bridge jobs
+     *
+     * @return array job_id => {job_id, kind, created_at, status}
+     */
+    public static function getActiveJobs(): array
+    {
+        $stored = Configuration::get(self::CONFIG_ACTIVE_JOBS);
+
+        if (empty($stored)) {
+            return [];
+        }
+
+        $jobs = json_decode($stored, true);
+
+        return is_array($jobs) ? $jobs : [];
+    }
+
+    /**
+     * Stop tracking a bridge job
+     */
+    public static function forgetJob(string $jobId): void
+    {
+        $jobs = self::getActiveJobs();
+        unset($jobs[$jobId]);
+        Configuration::updateValue(self::CONFIG_ACTIVE_JOBS, json_encode($jobs));
+    }
+
+    /**
+     * Poll all tracked bridge jobs; ingest results of finished jobs as drafts.
+     *
+     * Called from FotoHubScheduler::processCron and from the progress AJAX.
+     *
+     * @param FotoHubBridgeClient $bridge Bridge client
+     * @return array Summary: {polled, completed, ingested_drafts, failed}
+     */
+    public static function pollBridgeJobs(FotoHubBridgeClient $bridge): array
+    {
+        $summary = ['polled' => 0, 'completed' => 0, 'ingested_drafts' => 0, 'failed' => 0];
+        $jobs = self::getActiveJobs();
+
+        if (empty($jobs)) {
+            return $summary;
+        }
+
+        // Mutate one local copy and persist ONCE at the end. Writing inside the
+        // loop while also calling forgetJob() (which re-reads storage) would
+        // resurrect jobs that were just finished and removed.
+        foreach ($jobs as $jobId => $meta) {
+            $summary['polled']++;
+
+            try {
+                $status = $bridge->getJob((string) $jobId);
+            } catch (Exception $e) {
+                PrestaShopLogger::addLog('FOTOhub Bridge poll failed for job ' . $jobId . ': ' . $e->getMessage(), 2);
+                continue;
+            }
+
+            $state = $status['status'] ?? 'processing';
+
+            // Keep tracked counters fresh for the progress UI. Fall back to the
+            // remembered value so a response without total_items does not reset
+            // the progress column to 0.
+            $jobs[$jobId]['status'] = $state;
+            $jobs[$jobId]['done_items'] = (int) ($status['done_items'] ?? ($meta['done_items'] ?? 0));
+            $jobs[$jobId]['failed_items'] = (int) ($status['failed_items'] ?? ($meta['failed_items'] ?? 0));
+            $jobs[$jobId]['total_items'] = (int) ($status['total_items'] ?? ($meta['total_items'] ?? 0));
+
+            if (in_array($state, self::RUNNING_STATES, true)) {
+                continue;
+            }
+
+            if ($state === 'completed' || $state === 'completed_with_errors') {
+                $summary['completed']++;
+                $summary['ingested_drafts'] += self::ingestJobResults($bridge, (string) $jobId, $meta['kind'] ?? '');
+            } else {
+                // failed | cancelled
+                $summary['failed']++;
+                PrestaShopLogger::addLog('FOTOhub Bridge job ' . $jobId . ' ended with status ' . $state, 2);
+            }
+
+            // Terminal state: stop tracking
+            unset($jobs[$jobId]);
+        }
+
+        Configuration::updateValue(self::CONFIG_ACTIVE_JOBS, json_encode($jobs));
+
+        return $summary;
+    }
+
+    /**
+     * Fetch completed items of a finished job and store them as pending drafts
+     *
+     * @return int Number of drafts created
+     */
+    private static function ingestJobResults(FotoHubBridgeClient $bridge, string $jobId, string $kind): int
+    {
+        $created = 0;
+        $offset = 0;
+        $limit = 100;
+
+        while (true) {
+            try {
+                $page = $bridge->getJobItems($jobId, 'completed', $limit, $offset);
+            } catch (Exception $e) {
+                PrestaShopLogger::addLog('FOTOhub Bridge: item fetch failed for job ' . $jobId . ': ' . $e->getMessage(), 3);
+                break;
+            }
+
+            $items = $page['items'] ?? [];
+
+            if (!is_array($items) || empty($items)) {
+                break;
+            }
+
+            foreach ($items as $item) {
+                $created += self::ingestItemResult($item, $jobId, $kind);
+            }
+
+            if (count($items) < $limit) {
+                break;
+            }
+
+            $offset += $limit;
+        }
+
+        return $created;
+    }
+
+    /**
+     * Turn one bridge item into pending draft(s).
+     *
+     * Shared by the cron poll and the webhook receiver so external_id parsing
+     * and bridge_item_id deduplication live in exactly one place.
+     *
+     * @param array $item Bridge item {id, external_id, result, ...}
+     * @param string|null $jobId Job ID
+     * @param string|null $kind Job kind
+     * @return int Number of drafts created
+     */
+    public static function ingestItemResult(array $item, ?string $jobId = null, ?string $kind = null): int
+    {
+        [$idProduct, $idProductAttribute] = self::parseExternalId((string) ($item['external_id'] ?? ''));
+        $result = $item['result'] ?? [];
+        $bridgeItemId = !empty($item['id']) ? (string) $item['id'] : null;
+
+        if ($idProduct <= 0 || empty($result) || !is_array($result)) {
+            return 0;
+        }
+
+        $created = 0;
+
+        try {
+            if (!empty($result['image_urls']) && is_array($result['image_urls'])) {
+                $created += FotoHubDraft::add(
+                    $idProduct,
+                    FotoHubDraft::TYPE_IMAGE,
+                    ['image_urls' => array_values($result['image_urls'])],
+                    $jobId,
+                    $kind,
+                    $idProductAttribute,
+                    $bridgeItemId
+                ) > 0 ? 1 : 0;
+            }
+
+            if (!empty($result['text']) && is_array($result['text'])) {
+                $created += FotoHubDraft::add(
+                    $idProduct,
+                    FotoHubDraft::TYPE_TEXT,
+                    $result['text'],
+                    $jobId,
+                    $kind,
+                    $idProductAttribute,
+                    $bridgeItemId
+                ) > 0 ? 1 : 0;
+            }
+        } catch (Exception $e) {
+            PrestaShopLogger::addLog(
+                'FOTOhub Bridge: draft ingest failed for product ' . $idProduct . ': ' . $e->getMessage(),
+                3,
+                null,
+                'Product',
+                $idProduct
+            );
+        }
+
+        return $created;
+    }
+
+    /**
+     * Parse an item external_id back into [id_product, id_product_attribute].
+     *
+     * Per-variant jobs use "<id_product>:<id_product_attribute>"; per-product
+     * jobs use the bare product ID.
+     *
+     * @return array{0: int, 1: int}
+     */
+    public static function parseExternalId(string $externalId): array
+    {
+        if (strpos($externalId, ':') !== false) {
+            $parts = explode(':', $externalId, 2);
+
+            return [(int) $parts[0], (int) $parts[1]];
+        }
+
+        return [(int) $externalId, 0];
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Local fallback path (resumable synchronous pipeline)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Process a batch of products with the specified action against the
+     * direct api-server endpoints. Results land as pending drafts.
      *
      * @param array $productIds Array of product IDs to process
-     * @param string $action Action: 'generate', 'remove_background', 'upscale'
+     * @param string $action Action: generate, remove_background, replace_background,
+     *                       upscale, generate_video, copywrite, pipeline
      * @param array $options Additional options for the action
      * @return array Results array with status per product
      */
@@ -58,49 +596,58 @@ class FotoHubBulkProcessor
         $this->total = count($productIds);
 
         foreach ($productIds as $idProduct) {
-            $idProduct = (int) $idProduct;
+            $this->processOne((int) $idProduct, $action, $options);
             $this->current++;
-
-            try {
-                switch ($action) {
-                    case 'generate':
-                        $this->processGenerate($idProduct, $options);
-                        break;
-                    case 'remove_background':
-                        $this->processRemoveBackground($idProduct);
-                        break;
-                    case 'upscale':
-                        $this->processUpscale($idProduct, $options);
-                        break;
-                    case 'generate_video':
-                        $this->processGenerateVideo($idProduct, $options);
-                        break;
-                    case 'copywrite':
-                        $this->processCopywrite($idProduct, $options);
-                        break;
-                    case 'pipeline':
-                        $this->processPipeline($idProduct, $options);
-                        break;
-                    default:
-                        $this->addResult($idProduct, 'error', 'Unknown action: ' . $action);
-                }
-            } catch (Exception $e) {
-                $this->addResult($idProduct, 'error', $e->getMessage());
-                PrestaShopLogger::addLog(
-                    'FOTOhub bulk processing error: ' . $e->getMessage(),
-                    3,
-                    null,
-                    'Product',
-                    $idProduct
-                );
-            }
         }
 
         return $this->results;
     }
 
     /**
-     * Generate an AI image for a product
+     * Dispatch a single product through the local pipeline
+     */
+    private function processOne(int $idProduct, string $action, array $options): void
+    {
+        try {
+            switch ($action) {
+                case 'generate':
+                    $this->processGenerate($idProduct, $options);
+                    break;
+                case 'remove_background':
+                    $this->processRemoveBackground($idProduct);
+                    break;
+                case 'replace_background':
+                    $this->processReplaceBackground($idProduct, $options);
+                    break;
+                case 'upscale':
+                    $this->processUpscale($idProduct, $options);
+                    break;
+                case 'generate_video':
+                    $this->processGenerateVideo($idProduct, $options);
+                    break;
+                case 'copywrite':
+                    $this->processCopywrite($idProduct, $options);
+                    break;
+                case 'pipeline':
+                    $this->processPipeline($idProduct, $options);
+                    break;
+                default:
+                    $this->addResult($idProduct, 'error', 'Unknown action: ' . $action);
+            }
+        } catch (Exception $e) {
+            $this->addResult($idProduct, 'error', $e->getMessage());
+            PrestaShopLogger::addLog(
+                'FOTOhub bulk processing error: ' . $e->getMessage(),
+                3,
+                null,
+                'Product',
+                $idProduct
+            );
+        }
+    }
+
+    /**
+     * Generate an AI image for a product → pending draft
      */
     private function processGenerate(int $idProduct, array $options): void
     {
@@ -124,26 +671,17 @@ class FotoHubBulkProcessor
             $genOptions['negative_prompt'] = $options['negative_prompt'];
         }
 
+        if (!empty($options['num_images'])) {
+            $genOptions['num_images'] = (int) $options['num_images'];
+        }
+
         $result = $this->client->generateImage($prompt, $genOptions);
 
-        if (!empty($result['image_url'])) {
-            $success = $module->addImageToProduct($idProduct, $result['image_url']);
-
-            if ($success) {
-                $this->addResult($idProduct, 'success', 'Image generated', [
-                    'image_url' => $result['image_url'],
-                    'product_name' => $product->name,
-                ]);
-            } else {
-                $this->addResult($idProduct, 'error', 'Image generated but failed to save to product');
-            }
-        } else {
-            $this->addResult($idProduct, 'error', 'No image URL in response');
-        }
+        $this->storeImageDraft($idProduct, $result, 'image_generate', $product->name);
     }
 
     /**
-     * Remove background from a product's first image
+     * Remove background from a product's cover image → pending draft
      */
     private function processRemoveBackground(int $idProduct): void
     {
@@ -154,43 +692,45 @@ class FotoHubBulkProcessor
             return;
         }
 
-        $images = Image::getImages($this->idLang, $idProduct);
-
-        if (empty($images)) {
-            $this->addResult($idProduct, 'skipped', 'No images to process');
-            return;
-        }
-
-        // Process the cover image (first image)
-        $image = new Image((int) $images[0]['id_image']);
-        $imageUrl = $this->getProductImageUrl($idProduct, $image);
+        $imageUrl = $this->getCoverImageUrl($idProduct);
 
         if (empty($imageUrl)) {
-            $this->addResult($idProduct, 'error', 'Could not determine image URL');
+            $this->addResult($idProduct, 'skipped', 'No images to process');
             return;
         }
 
         $result = $this->client->removeBackground($imageUrl);
 
-        if (!empty($result['image_url'])) {
-            $module = Module::getInstanceByName('fotohubai');
-            $success = $module->addImageToProduct($idProduct, $result['image_url']);
-
-            if ($success) {
-                $this->addResult($idProduct, 'success', 'Background removed', [
-                    'image_url' => $result['image_url'],
-                    'product_name' => $product->name,
-                ]);
-            } else {
-                $this->addResult($idProduct, 'error', 'Background removed but failed to save');
-            }
-        } else {
-            $this->addResult($idProduct, 'error', 'No image URL in response');
-        }
+        $this->storeImageDraft($idProduct, $result, 'bg_remove', $product->name);
     }
 
     /**
-     * Upscale a product's first image
+     * Replace background of a product's cover image → pending draft
+     */
+    private function processReplaceBackground(int $idProduct, array $options): void
+    {
+        $product = new Product($idProduct, false, $this->idLang);
+
+        if (!Validate::isLoadedObject($product)) {
+            $this->addResult($idProduct, 'error', 'Product not found');
+            return;
+        }
+
+        $imageUrl = $this->getCoverImageUrl($idProduct);
+
+        if (empty($imageUrl)) {
+            $this->addResult($idProduct, 'skipped', 'No images to process');
+            return;
+        }
+
+        $background = $options['background'] ?? 'clean white studio background';
+        $result = $this->client->replaceBackground($imageUrl, $background, $options['background_type'] ?? 'auto');
+
+        $this->storeImageDraft($idProduct, $result, 'bg_replace', $product->name);
+    }
+
+    /**
+     * Upscale a product's cover image → pending draft
      */
     private function processUpscale(int $idProduct, array $options): void
     {
@@ -201,43 +741,21 @@ class FotoHubBulkProcessor
             return;
         }
 
-        $images = Image::getImages($this->idLang, $idProduct);
-
-        if (empty($images)) {
-            $this->addResult($idProduct, 'skipped', 'No images to upscale');
-            return;
-        }
-
-        $image = new Image((int) $images[0]['id_image']);
-        $imageUrl = $this->getProductImageUrl($idProduct, $image);
+        $imageUrl = $this->getCoverImageUrl($idProduct);
 
         if (empty($imageUrl)) {
-            $this->addResult($idProduct, 'error', 'Could not determine image URL');
+            $this->addResult($idProduct, 'skipped', 'No images to upscale');
             return;
         }
 
         $scale = (int) ($options['scale'] ?? 2);
         $result = $this->client->upscaleImage($imageUrl, $scale);
 
-        if (!empty($result['image_url'])) {
-            $module = Module::getInstanceByName('fotohubai');
-            $success = $module->addImageToProduct($idProduct, $result['image_url']);
-
-            if ($success) {
-                $this->addResult($idProduct, 'success', 'Image upscaled (' . $scale . 'x)', [
-                    'image_url' => $result['image_url'],
-                    'product_name' => $product->name,
-                ]);
-            } else {
-                $this->addResult($idProduct, 'error', 'Image upscaled but failed to save');
-            }
-        } else {
-            $this->addResult($idProduct, 'error', 'No image URL in response');
-        }
+        $this->storeImageDraft($idProduct, $result, 'upscale', $product->name);
     }
 
     /**
-     * Generate a video from a product's cover image
+     * Generate a video from a product's cover image (async, tracked by job_id)
      */
     private function processGenerateVideo(int $idProduct, array $options): void
     {
@@ -248,18 +766,10 @@ class FotoHubBulkProcessor
             return;
         }
 
-        $images = Image::getImages($this->idLang, $idProduct);
-
-        if (empty($images)) {
-            $this->addResult($idProduct, 'skipped', 'No images for video generation');
-            return;
-        }
-
-        $image = new Image((int) $images[0]['id_image']);
-        $imageUrl = $this->getProductImageUrl($idProduct, $image);
+        $imageUrl = $this->getCoverImageUrl($idProduct);
 
         if (empty($imageUrl)) {
-            $this->addResult($idProduct, 'error', 'Could not determine image URL');
+            $this->addResult($idProduct, 'skipped', 'No images for video generation');
             return;
         }
 
@@ -285,18 +795,23 @@ class FotoHubBulkProcessor
 
         $result = $this->client->generateVideo($prompt, $videoOptions);
 
-        if (!empty($result['job_id'])) {
+        if (!empty($result['video_url'])) {
+            $this->addResult($idProduct, 'success', 'Video generated', [
+                'video_url' => $result['video_url'],
+                'product_name' => $product->name,
+            ]);
+        } elseif (!empty($result['job_id'])) {
             $this->addResult($idProduct, 'success', 'Video generation started', [
                 'job_id' => $result['job_id'],
                 'product_name' => $product->name,
             ]);
         } else {
-            $this->addResult($idProduct, 'error', 'No job ID in video generation response');
+            $this->addResult($idProduct, 'error', 'No video URL or job ID in response');
         }
     }
 
     /**
-     * Generate AI copywriting for a product (description, meta, bullets)
+     * Generate AI copywriting for a product → pending TEXT draft
      */
     private function processCopywrite(int $idProduct, array $options): void
     {
@@ -309,7 +824,9 @@ class FotoHubBulkProcessor
 
         // Gather product context
         $productName = $product->name;
-        $shortDesc = strip_tags($product->description_short[$this->idLang] ?? '');
+        $shortDesc = strip_tags(is_array($product->description_short)
+            ? ($product->description_short[$this->idLang] ?? '')
+            : (string) $product->description_short);
         $categories = [];
 
         $productCategories = Product::getProductCategoriesFull($idProduct, $this->idLang);
@@ -320,8 +837,10 @@ class FotoHubBulkProcessor
         $categoryStr = implode(', ', $categories);
         $language = Language::getLanguage($this->idLang);
         $langName = $language['name'] ?? 'English';
+        $tone = $options['tone'] ?? Configuration::get('FOTOHUBAI_COPYWRITER_TONE') ?: 'professional';
 
-        $systemPrompt = 'You are a professional e-commerce copywriter. Write compelling product descriptions that are SEO-optimized and persuasive. Always respond in ' . $langName . '.';
+        $systemPrompt = 'You are a professional e-commerce copywriter. Write compelling product descriptions '
+            . 'that are SEO-optimized and persuasive, in a ' . $tone . ' tone. Always respond in ' . $langName . '.';
 
         $userPrompt = "Write a professional product description for the following product:\n\n"
             . "Product name: {$productName}\n"
@@ -355,38 +874,34 @@ class FotoHubBulkProcessor
             return;
         }
 
-        // Parse the response and update product
-        $langId = $this->idLang;
+        // Parse the response into structured text fields
+        $payload = [];
 
-        // Extract description
         if (preg_match('/DESCRIPTION:\s*\n(.*?)(?=\n\s*META:)/s', $content, $matches)) {
-            $product->description[$langId] = trim($matches[1]);
+            $payload['description'] = trim($matches[1]);
         } else {
-            // Use entire content as description if parsing fails
-            $product->description[$langId] = '<p>' . nl2br(htmlspecialchars($content)) . '</p>';
+            $payload['description'] = '<p>' . nl2br(htmlspecialchars($content)) . '</p>';
         }
 
-        // Extract meta description
         if (preg_match('/META:\s*\n(.*?)(?=\n\s*BULLETS:)/s', $content, $matches)) {
-            $meta = trim($matches[1]);
-            $product->meta_description[$langId] = mb_substr($meta, 0, 160);
+            $payload['meta_description'] = mb_substr(trim($matches[1]), 0, 160);
         }
 
-        // Extract bullet points and append to description
         if (preg_match('/BULLETS:\s*\n(.*)/s', $content, $matches)) {
-            $bullets = trim($matches[1]);
-            $product->description[$langId] .= "\n" . $bullets;
+            $payload['description'] .= "\n" . trim($matches[1]);
         }
 
-        $product->save();
+        // DRAFT-FIRST: store for merchant review, never write live content here
+        FotoHubDraft::add($idProduct, FotoHubDraft::TYPE_TEXT, $payload, null, 'description');
 
-        $this->addResult($idProduct, 'success', 'Product copy generated', [
+        $this->addResult($idProduct, 'success', 'Product copy generated (draft pending review)', [
             'product_name' => $productName,
         ]);
     }
 
     /**
-     * Run a full pipeline: generate image + remove background + write description
+     * Run a full pipeline: generate image + remove background + write description.
+     * All output lands as pending drafts.
      */
     private function processPipeline(int $idProduct, array $options): void
     {
@@ -424,44 +939,44 @@ class FotoHubBulkProcessor
             return;
         }
 
-        // Step 2: Remove background
-        try {
-            $bgResult = $this->client->removeBackground($imageUrl);
+        // Step 2: Remove background (only possible on http(s) URLs)
+        $finalImageUrl = $imageUrl;
 
-            if (!empty($bgResult['image_url'])) {
-                $steps[] = 'background_removed';
-                $finalImageUrl = $bgResult['image_url'];
-            } else {
-                // Use original image if bg removal fails to return URL
-                $finalImageUrl = $imageUrl;
-                $steps[] = 'background_removal_skipped';
+        if (strpos($imageUrl, 'http') === 0) {
+            try {
+                $bgResult = $this->client->removeBackground($imageUrl);
+
+                if (!empty($bgResult['image_url'])) {
+                    $steps[] = 'background_removed';
+                    $finalImageUrl = $bgResult['image_url'];
+                } else {
+                    $steps[] = 'background_removal_skipped';
+                }
+            } catch (Exception $e) {
+                $steps[] = 'background_removal_failed';
+                PrestaShopLogger::addLog(
+                    'FOTOhub pipeline: bg removal failed for product ' . $idProduct . ': ' . $e->getMessage(),
+                    2,
+                    null,
+                    'Product',
+                    $idProduct
+                );
             }
-        } catch (Exception $e) {
-            // Continue pipeline even if bg removal fails
-            $finalImageUrl = $imageUrl;
-            $steps[] = 'background_removal_failed';
-            PrestaShopLogger::addLog(
-                'FOTOhub pipeline: bg removal failed for product ' . $idProduct . ': ' . $e->getMessage(),
-                2,
-                null,
-                'Product',
-                $idProduct
-            );
+        } else {
+            $steps[] = 'background_removal_skipped';
         }
 
-        // Save the image to product
+        // DRAFT-FIRST: image draft for merchant review
         try {
-            $success = $module->addImageToProduct($idProduct, $finalImageUrl);
-            if ($success) {
-                $steps[] = 'image_saved';
-            } else {
-                $steps[] = 'image_save_failed';
-            }
+            FotoHubDraft::add($idProduct, FotoHubDraft::TYPE_IMAGE, [
+                'image_urls' => [$finalImageUrl],
+            ], null, 'complete_listing');
+            $steps[] = 'image_draft_saved';
         } catch (Exception $e) {
-            $steps[] = 'image_save_failed';
+            $steps[] = 'image_draft_failed';
         }
 
-        // Step 3: Generate copywriting
+        // Step 3: Generate copywriting (stores its own text draft)
         try {
             $this->processCopywrite($idProduct, $options);
             $steps[] = 'copy_generated';
@@ -476,7 +991,7 @@ class FotoHubBulkProcessor
             );
         }
 
-        $this->addResult($idProduct, 'success', 'Pipeline completed', [
+        $this->addResult($idProduct, 'success', 'Pipeline completed (drafts pending review)', [
             'product_name' => $product->name,
             'steps_completed' => $steps,
             'final_image_url' => $finalImageUrl,
@@ -484,34 +999,85 @@ class FotoHubBulkProcessor
     }
 
     /**
-     * Get the public URL of a product image
+     * Store an image API result as a pending draft and record the outcome
      */
-    private function getProductImageUrl(int $idProduct, Image $image): string
+    private function storeImageDraft(int $idProduct, array $result, string $kind, $productName): void
     {
-        $link = Context::getContext()->link;
+        $imageUrl = $result['image_url'] ?? '';
 
-        // Try to get the image URL via PrestaShop's Link class
+        if (empty($imageUrl)) {
+            $this->addResult($idProduct, 'error', 'No image URL in response');
+            return;
+        }
+
+        FotoHubDraft::add($idProduct, FotoHubDraft::TYPE_IMAGE, [
+            'image_urls' => [$imageUrl],
+        ], null, $kind);
+
+        $this->addResult($idProduct, 'success', 'Result saved as draft (pending review)', [
+            'image_url' => $imageUrl,
+            'product_name' => $productName,
+        ]);
+    }
+
+    /**
+     * Get the public URL of a product's cover image
+     */
+    public function getCoverImageUrl(int $idProduct): string
+    {
+        $images = Image::getImages($this->idLang, $idProduct);
+
+        if (empty($images)) {
+            return '';
+        }
+
+        return $this->buildImageUrl($idProduct, (int) $images[0]['id_image']);
+    }
+
+    /**
+     * Build a publicly reachable URL for one product image.
+     *
+     * The bridge fetches this URL from outside the shop, so it must be
+     * absolute; the manual /img/p/ path is the fallback when the link builder
+     * is unavailable (e.g. running from cron with no front-office context).
+     */
+    private function buildImageUrl(int $idProduct, int $idImage): string
+    {
+        if ($idImage <= 0) {
+            return '';
+        }
+
+        $image = new Image($idImage);
+
+        if (!Validate::isLoadedObject($image)) {
+            return '';
+        }
+
         try {
-            $imageUrl = $link->getImageLink(
+            $imageUrl = Context::getContext()->link->getImageLink(
                 Product::getProductName($idProduct),
                 $image->id,
                 ImageType::getFormattedName('large')
             );
 
             if (!empty($imageUrl)) {
-                // Ensure it's an absolute URL
                 if (strpos($imageUrl, 'http') !== 0) {
-                    $imageUrl = 'https://' . $imageUrl;
+                    $imageUrl = 'https://' . ltrim($imageUrl, '/');
                 }
+
                 return $imageUrl;
             }
         } catch (Exception $e) {
             // Fallback below
         }
 
-        // Fallback: construct URL manually
-        $shopUrl = rtrim(Configuration::get('PS_SSL_ENABLED') ?
-            Tools::getShopDomainSsl(true) : Tools::getShopDomain(true), '/');
+        $shopUrl = rtrim(Configuration::get('PS_SSL_ENABLED')
+            ? Tools::getShopDomainSsl(true)
+            : Tools::getShopDomain(true), '/');
+
+        if (strpos($shopUrl, 'http') !== 0) {
+            $shopUrl = 'https://' . $shopUrl;
+        }
 
         return $shopUrl . '/img/p/' . $image->getImgPath() . '.jpg';
     }
@@ -662,42 +1228,8 @@ class FotoHubBulkProcessor
         $this->total = count($productIds);
 
         foreach ($remainingProducts as $idProduct) {
-            $idProduct = (int) $idProduct;
+            $this->processOne((int) $idProduct, $action, $options);
             $this->current++;
-
-            try {
-                switch ($action) {
-                    case 'generate':
-                        $this->processGenerate($idProduct, $options);
-                        break;
-                    case 'remove_background':
-                        $this->processRemoveBackground($idProduct);
-                        break;
-                    case 'upscale':
-                        $this->processUpscale($idProduct, $options);
-                        break;
-                    case 'generate_video':
-                        $this->processGenerateVideo($idProduct, $options);
-                        break;
-                    case 'copywrite':
-                        $this->processCopywrite($idProduct, $options);
-                        break;
-                    case 'pipeline':
-                        $this->processPipeline($idProduct, $options);
-                        break;
-                    default:
-                        $this->addResult($idProduct, 'error', 'Unknown action: ' . $action);
-                }
-            } catch (Exception $e) {
-                $this->addResult($idProduct, 'error', $e->getMessage());
-                PrestaShopLogger::addLog(
-                    'FOTOhub bulk processing error: ' . $e->getMessage(),
-                    3,
-                    null,
-                    'Product',
-                    $idProduct
-                );
-            }
 
             // Save progress after each item
             $this->saveProgress($batchId);

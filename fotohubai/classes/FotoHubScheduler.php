@@ -296,27 +296,18 @@ class FotoHubScheduler
      * Process the next batch of scheduled jobs
      *
      * This is the main method called by PrestaShop's cron system. It:
-     * 1. Retries any items in 'retry' status
-     * 2. Fetches the next $batchSize pending items
-     * 3. Executes each one using FotoHubApiClient + FotoHubBulkProcessor
-     * 4. Records success/failure and logs via PrestaShopLogger
+     * 1. Polls active commerce-bridge jobs and ingests finished results as drafts
+     * 2. Retries any items in 'retry' status
+     * 3. Fetches the next $batchSize pending items
+     * 4. Executes each one using FotoHubApiClient + FotoHubBulkProcessor
+     * 5. Records success/failure and logs via PrestaShopLogger
      *
      * @param int $batchSize Number of jobs to process per cron run
-     * @return array Summary with keys: processed, success, failed
+     * @return array Summary with keys: processed, success, failed, bridge
      */
     public static function processCron(int $batchSize = 5): array
     {
-        $summary = ['processed' => 0, 'success' => 0, 'failed' => 0];
-
-        // Retry any previously-failed items that are eligible
-        self::retryFailed();
-
-        // Fetch next batch
-        $jobs = self::getNextPending($batchSize);
-
-        if (empty($jobs)) {
-            return $summary;
-        }
+        $summary = ['processed' => 0, 'success' => 0, 'failed' => 0, 'bridge' => null];
 
         // Instantiate API client
         $module = Module::getInstanceByName('fotohubai');
@@ -336,6 +327,25 @@ class FotoHubScheduler
                 'FOTOhub Scheduler: API key is not configured',
                 3
             );
+            return $summary;
+        }
+
+        // Step 1: poll active commerce-bridge jobs (progress + draft ingest).
+        // This also covers stores that never receive webhook callbacks.
+        try {
+            $bridge = new FotoHubBridgeClient($apiKey);
+            $summary['bridge'] = FotoHubBulkProcessor::pollBridgeJobs($bridge);
+        } catch (Exception $e) {
+            PrestaShopLogger::addLog('FOTOhub Scheduler: bridge poll failed — ' . $e->getMessage(), 2);
+        }
+
+        // Retry any previously-failed items that are eligible
+        self::retryFailed();
+
+        // Fetch next batch
+        $jobs = self::getNextPending($batchSize);
+
+        if (empty($jobs)) {
             return $summary;
         }
 

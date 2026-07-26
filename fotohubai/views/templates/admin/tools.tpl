@@ -369,7 +369,8 @@
         }
 
         var xhr = new XMLHttpRequest();
-        var url = '{$fotohub_tools_url|escape:"javascript":"UTF-8"}&ajax=1&action=processTool';
+        var url = '{$fotohub_tools_url|escape:"javascript":"UTF-8"}&ajax=1&action=processTool'
+            + '&token={$fotohub_token|escape:"javascript":"UTF-8"}';
         xhr.open('POST', url, true);
         xhr.setRequestHeader('Content-Type', 'application/json');
         xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
@@ -414,7 +415,8 @@
 
         btn.disabled = true;
         var xhr = new XMLHttpRequest();
-        var url = '{$fotohub_tools_url|escape:"javascript":"UTF-8"}&ajax=1&action=saveToProduct';
+        var url = '{$fotohub_tools_url|escape:"javascript":"UTF-8"}&ajax=1&action=saveToProduct'
+            + '&token={$fotohub_token|escape:"javascript":"UTF-8"}';
         xhr.open('POST', url, true);
         xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
         xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');

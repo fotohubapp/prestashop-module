@@ -231,7 +231,8 @@
         statusEl.innerHTML = '<i class="icon-spinner icon-spin"></i> {l s="Submitting..." mod="fotohubai" js=1}';
 
         var xhr = new XMLHttpRequest();
-        var url = '{$fotohub_video_url|escape:"javascript":"UTF-8"}&ajax=1&action=generateVideo';
+        var url = '{$fotohub_video_url|escape:"javascript":"UTF-8"}&ajax=1&action=generateVideo'
+            + '&token={$fotohub_token|escape:"javascript":"UTF-8"}';
 
         xhr.open('POST', url, true);
         xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
@@ -278,7 +279,9 @@
         }
         pollingInterval = setInterval(function() {
             var xhr = new XMLHttpRequest();
-            var url = '{$fotohub_video_url|escape:"javascript":"UTF-8"}&ajax=1&action=checkStatus&job_id=' + jobId;
+            var url = '{$fotohub_video_url|escape:"javascript":"UTF-8"}&ajax=1&action=checkStatus'
+                + '&token={$fotohub_token|escape:"javascript":"UTF-8"}'
+                + '&job_id=' + encodeURIComponent(jobId);
             xhr.open('GET', url, true);
             xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
             xhr.onload = function() {

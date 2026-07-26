@@ -214,7 +214,7 @@
 </div>
 
 <div class="panel-footer text-right">
-    <a href="{$fotohub_analytics_url|escape:'htmlall':'UTF-8'}&ajax=1&action=export" class="btn btn-default">
+    <a href="{$fotohub_analytics_url|escape:'htmlall':'UTF-8'}&ajax=1&action=export&token={$fotohub_token|escape:'html':'UTF-8'}" class="btn btn-default">
         <i class="icon-download"></i> {l s='Export CSV (Last 90 days)' mod='fotohubai'}
     </a>
 </div>

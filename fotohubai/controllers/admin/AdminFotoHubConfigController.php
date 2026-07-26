@@ -2,7 +2,8 @@
 /**
  * FOTOhub AI Configuration Controller
  *
- * Admin controller for module settings: API key, default model, dimensions.
+ * Connection wizard (API key → balance validation → bridge registration),
+ * module settings, credits meter, connection health check, and MCP help tab.
  *
  * @author    FOTOhub <support@fotohub.app>
  * @copyright 2026 FOTOhub
@@ -12,6 +13,8 @@
 if (!defined('_PS_VERSION_')) {
     exit;
 }
+
+require_once _PS_MODULE_DIR_ . 'fotohubai/classes/FotoHubBridgeClient.php';
 
 class AdminFotoHubConfigController extends ModuleAdminController
 {
@@ -56,31 +59,70 @@ class AdminFotoHubConfigController extends ModuleAdminController
             $this->processTestConnection();
         }
 
-        // Get available models for the dropdown
-        $models = $this->getAvailableModels();
+        if (Tools::isSubmit('healthCheck')) {
+            $this->processHealthCheck();
+        }
+
+        // Documented configure vars + credits meter
+        $module = Module::getInstanceByName('fotohubai');
+        $apiKey = $module->getDecryptedApiKey();
+        $configured = !empty($apiKey);
+        $credits = null;
+        $plan = null;
+
+        if ($configured) {
+            try {
+                $client = new FotoHubApiClient($apiKey);
+                $balance = $client->getBalance();
+                $credits = $client->getCreditsAvailable();
+                $plan = $balance['tier'] ?? null;
+            } catch (Exception $e) {
+                // Balance unavailable — page still renders
+            }
+        }
 
         $this->context->smarty->assign([
-            'fotohub_api_key_set' => !empty(Configuration::get('FOTOHUBAI_API_KEY')),
+            // Documented configure Smarty vars
+            'fotohub_configured' => $configured,
+            'fotohub_credits' => $credits,
+            'fotohub_plan' => $plan,
+            // Credits meter / low balance warning (feature 9)
+            'fotohub_low_balance' => ($credits !== null && $credits < 50),
+            // Connection wizard state
+            'fotohub_api_key_set' => $configured,
+            'fotohub_connection_id' => FotoHubBridgeClient::getStoredConnectionId(),
+            // Settings
             'fotohub_default_model' => Configuration::get('FOTOHUBAI_DEFAULT_MODEL'),
             'fotohub_default_width' => (int) Configuration::get('FOTOHUBAI_DEFAULT_WIDTH'),
             'fotohub_default_height' => (int) Configuration::get('FOTOHUBAI_DEFAULT_HEIGHT'),
             'fotohub_auto_generate' => (int) Configuration::get('FOTOHUBAI_AUTO_GENERATE'),
-            'fotohub_models' => $models,
+            'fotohub_models' => $this->getAvailableModels(),
             'fotohub_config_url' => $this->context->link->getAdminLink('AdminFotoHubConfig'),
             'fotohub_bulk_url' => $this->context->link->getAdminLink('AdminFotoHubBulk'),
+            'fotohub_drafts_url' => $this->context->link->getAdminLink('AdminFotohubDrafts'),
             'fotohub_module_version' => $this->module->version,
+            // MCP help tab (feature 10)
+            'fotohub_mcp_url' => 'https://apis.fotohub.app/mcp/',
+            // The AJAX endpoints verify this token explicitly (CSRF).
+            'fotohub_token' => $this->token,
         ]);
 
         $this->setTemplate('configure.tpl');
     }
 
     /**
-     * Process configuration form submission
+     * Process configuration form submission.
+     *
+     * Connection wizard flow: when a new API key is entered, validate it via
+     * GET /v1/billing/balance, then register the store as a commerce-bridge
+     * connection and persist connection_id + callback_secret. The key itself
+     * is stored AES-256-CBC encrypted with an explicit encryption flag.
      */
     private function processConfiguration(): void
     {
         $apiKey = Tools::getValue('FOTOHUBAI_API_KEY');
         $defaultModel = Tools::getValue('FOTOHUBAI_DEFAULT_MODEL');
+        $defaultPreset = Tools::getValue('FOTOHUBAI_DEFAULT_PRESET');
         $defaultWidth = (int) Tools::getValue('FOTOHUBAI_DEFAULT_WIDTH');
         $defaultHeight = (int) Tools::getValue('FOTOHUBAI_DEFAULT_HEIGHT');
         $autoGenerate = (int) Tools::getValue('FOTOHUBAI_AUTO_GENERATE');
@@ -96,16 +138,49 @@ class AdminFotoHubConfigController extends ModuleAdminController
             return;
         }
 
-        // Store API key encrypted (only update if a new key was provided)
+        // Connection wizard: only when a new key was actually provided
         if (!empty($apiKey) && $apiKey !== '••••••••') {
-            $encrypted = FotoHubAi::encryptApiKey($apiKey);
-            Configuration::updateValue('FOTOHUBAI_API_KEY', $encrypted);
+            // Step 1: validate the key against the live API
+            $client = new FotoHubApiClient($apiKey);
+
+            try {
+                $client->getBalance();
+            } catch (Exception $e) {
+                $this->errors[] = $this->l('API key validation failed: ') . $e->getMessage();
+                return;
+            }
+
+            // Step 2: store the key encrypted with the explicit flag
+            if (!FotoHubAi::storeApiKey($apiKey)) {
+                $this->errors[] = $this->l('Failed to store the API key.');
+                return;
+            }
+
+            // Step 3: register the bridge connection (idempotent)
+            try {
+                $bridge = new FotoHubBridgeClient($apiKey);
+                $shopUrl = rtrim(Configuration::get('PS_SSL_ENABLED')
+                    ? Tools::getShopDomainSsl(true)
+                    : Tools::getShopDomain(true), '/');
+                $shopName = (string) Configuration::get('PS_SHOP_NAME');
+                $callbackUrl = $shopUrl . '/module/fotohubai/webhook';
+
+                $bridge->ensureConnection($shopUrl, $shopName ?: 'PrestaShop store', $callbackUrl);
+                $this->confirmations[] = $this->l('Store connected to FOTOhub commerce-bridge.');
+            } catch (Exception $e) {
+                // Not fatal: direct API ops still work without a bridge connection
+                $this->warnings[] = $this->l('API key saved, but bridge registration failed: ') . $e->getMessage();
+            }
         }
 
         Configuration::updateValue('FOTOHUBAI_DEFAULT_MODEL', pSQL($defaultModel));
         Configuration::updateValue('FOTOHUBAI_DEFAULT_WIDTH', $defaultWidth);
         Configuration::updateValue('FOTOHUBAI_DEFAULT_HEIGHT', $defaultHeight);
         Configuration::updateValue('FOTOHUBAI_AUTO_GENERATE', $autoGenerate);
+
+        if ($defaultPreset !== false) {
+            Configuration::updateValue('FOTOHUBAI_DEFAULT_PRESET', pSQL((string) $defaultPreset));
+        }
 
         $this->confirmations[] = $this->l('Settings saved successfully.');
     }
@@ -126,16 +201,47 @@ class AdminFotoHubConfigController extends ModuleAdminController
         $client = new FotoHubApiClient($apiKey);
 
         try {
-            $balance = $client->getBalance();
-            $credits = $balance['credits'] ?? $balance['balance'] ?? 'unknown';
-            $this->confirmations[] = $this->l('Connection successful! Your credit balance: ') . $credits;
+            $credits = $client->getCreditsAvailable();
+            $this->confirmations[] = $this->l('Connection successful! Available credits: ') . $credits;
         } catch (Exception $e) {
             $this->errors[] = $this->l('Connection failed: ') . $e->getMessage();
         }
     }
 
     /**
-     * Handle AJAX requests (generate image from product page)
+     * Connection health check: bridge GET /health + balance call (feature 11)
+     */
+    private function processHealthCheck(): void
+    {
+        $module = Module::getInstanceByName('fotohubai');
+        $apiKey = $module->getDecryptedApiKey();
+
+        if (empty($apiKey)) {
+            $this->errors[] = $this->l('Please save your API key first.');
+            return;
+        }
+
+        $bridge = new FotoHubBridgeClient($apiKey);
+        $status = $bridge->healthCheck();
+
+        if ($status['healthy']) {
+            $credits = 0.0;
+            if (!empty($status['balance'])) {
+                $credits = (float) ($status['balance']['credits']['remaining_period']
+                    ?? $status['balance']['credits_available'] ?? 0);
+            }
+            $this->confirmations[] = $this->l('Connection healthy. Bridge reachable, balance OK. Available credits: ') . $credits;
+        } else {
+            $this->errors[] = $this->l('Health check failed: ') . ($status['error'] ?? 'unknown');
+        }
+    }
+
+    /**
+     * Handle AJAX requests (generate image from product page).
+     *
+     * Every branch either spends credits or exposes account data, so the admin
+     * token (CSRF) is verified first and generation additionally requires the
+     * controller's edit permission.
      */
     private function processAjax(): void
     {
@@ -143,14 +249,29 @@ class AdminFotoHubConfigController extends ModuleAdminController
 
         header('Content-Type: application/json');
 
+        if (!$this->verifyRequestToken()) {
+            http_response_code(403);
+            echo json_encode(['error' => 'Invalid security token']);
+            exit;
+        }
+
         switch ($action) {
             case 'generate':
+                if (!$this->canEdit()) {
+                    http_response_code(403);
+                    echo json_encode(['error' => 'Insufficient permission']);
+                    exit;
+                }
                 $this->ajaxGenerate();
                 break;
             case 'test':
                 $this->ajaxTestConnection();
                 break;
+            case 'balance':
+                $this->ajaxBalance();
+                break;
             default:
+                http_response_code(400);
                 echo json_encode(['error' => 'Unknown action']);
         }
 
@@ -158,7 +279,32 @@ class AdminFotoHubConfigController extends ModuleAdminController
     }
 
     /**
-     * AJAX: Generate image for a product
+     * Verify the admin CSRF token for the current request
+     */
+    private function verifyRequestToken(): bool
+    {
+        $token = Tools::getValue('token');
+
+        if (!is_string($token) || $token === '') {
+            return false;
+        }
+
+        return hash_equals((string) $this->token, $token);
+    }
+
+    /**
+     * Does the employee hold the edit permission on this controller?
+     */
+    private function canEdit(): bool
+    {
+        return (bool) Access::isGranted(
+            'ROLE_MOD_TAB_' . strtoupper($this->controller_name) . '_UPDATE',
+            $this->context->employee->id_profile
+        );
+    }
+
+    /**
+     * AJAX: Generate image for a product (result lands as a pending draft)
      */
     private function ajaxGenerate(): void
     {
@@ -192,12 +338,17 @@ class AdminFotoHubConfigController extends ModuleAdminController
             ]);
 
             if (!empty($result['image_url'])) {
-                $saved = $module->addImageToProduct($idProduct, $result['image_url']);
+                // DRAFT-FIRST: pending review, not written to the live product
+                $idDraft = FotoHubDraft::add($idProduct, FotoHubDraft::TYPE_IMAGE, [
+                    'image_urls' => [$result['image_url']],
+                ], null, 'image_generate');
+
                 echo json_encode([
                     'success' => true,
                     'image_url' => $result['image_url'],
-                    'saved' => $saved,
-                    'message' => $saved ? 'Image generated and added to product' : 'Image generated but could not be saved',
+                    'draft_id' => $idDraft,
+                    'message' => 'Image generated — review it in Drafts Review before it goes live',
+                    'drafts_url' => $this->context->link->getAdminLink('AdminFotohubDrafts'),
                 ]);
             } else {
                 echo json_encode(['error' => 'No image returned from API']);
@@ -223,10 +374,9 @@ class AdminFotoHubConfigController extends ModuleAdminController
         $client = new FotoHubApiClient($apiKey);
 
         try {
-            $balance = $client->getBalance();
             echo json_encode([
                 'success' => true,
-                'credits' => $balance['credits'] ?? $balance['balance'] ?? 0,
+                'credits' => $client->getCreditsAvailable(),
             ]);
         } catch (Exception $e) {
             echo json_encode(['error' => $e->getMessage()]);
@@ -234,19 +384,47 @@ class AdminFotoHubConfigController extends ModuleAdminController
     }
 
     /**
-     * Get available models list
+     * AJAX: Credits meter refresh
+     */
+    private function ajaxBalance(): void
+    {
+        $module = Module::getInstanceByName('fotohubai');
+        $apiKey = $module->getDecryptedApiKey();
+
+        if (empty($apiKey)) {
+            echo json_encode(['error' => 'API key not configured']);
+            return;
+        }
+
+        try {
+            $client = new FotoHubApiClient($apiKey);
+            $credits = $client->getCreditsAvailable();
+            echo json_encode([
+                'success' => true,
+                'credits' => $credits,
+                'low_balance' => $credits < 50,
+            ]);
+        } catch (Exception $e) {
+            echo json_encode(['error' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Get available image models (mirrors FotoHubBridgeClient::IMAGE_MODELS)
      */
     private function getAvailableModels(): array
     {
-        // Default models — can be refreshed via API
-        return [
-            ['id' => 'seedream-5-0-260128', 'name' => 'SeeDream 5.0 (Recommended)'],
-            ['id' => 'flux-1-1-pro', 'name' => 'Flux 1.1 Pro'],
-            ['id' => 'flux-1-1-pro-ultra', 'name' => 'Flux 1.1 Pro Ultra'],
-            ['id' => 'ideogram-v3', 'name' => 'Ideogram v3'],
-            ['id' => 'recraft-v3', 'name' => 'Recraft v3'],
-            ['id' => 'stable-diffusion-xl', 'name' => 'Stable Diffusion XL'],
-        ];
+        $models = [];
+
+        foreach (FotoHubBridgeClient::IMAGE_MODELS as $id => $meta) {
+            $models[] = [
+                'id' => $id,
+                'name' => $meta['name'],
+                'credits' => $meta['credits'],
+            ];
+        }
+
+        return $models;
     }
 
     /**

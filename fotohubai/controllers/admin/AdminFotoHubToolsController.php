@@ -13,6 +13,7 @@ if (!defined('_PS_VERSION_')) {
     exit;
 }
 
+require_once _PS_MODULE_DIR_ . 'fotohubai/classes/FotoHubApiClient.php';
 require_once _PS_MODULE_DIR_ . 'fotohubai/classes/FotoHubStabilityTools.php';
 
 class AdminFotoHubToolsController extends ModuleAdminController
@@ -43,25 +44,40 @@ class AdminFotoHubToolsController extends ModuleAdminController
                 . $this->l('Go to Configuration') . '</a>';
         }
 
-        // Handle AJAX requests
+        // Handle AJAX requests. Every branch spends credits and writes to a
+        // product, so the admin token (CSRF) and the controller's edit
+        // permission are both required — a logged-in session is not enough.
         if (Tools::getValue('ajax') && Tools::getValue('action')) {
             $action = Tools::getValue('action');
+
+            if (!$this->verifyRequestToken()) {
+                $this->respondJson(['error' => 'Invalid security token'], 403);
+            }
+
+            if (!$this->canEdit()) {
+                $this->respondJson(['error' => 'Insufficient permission'], 403);
+            }
 
             switch ($action) {
                 case 'processTool':
                     $this->ajaxProcessProcessTool();
                     break;
+                case 'saveToProduct':
+                    $this->ajaxProcessSaveToProduct();
+                    break;
                 default:
-                    header('Content-Type: application/json');
-                    echo json_encode(['error' => 'Unknown action']);
-                    exit;
+                    $this->respondJson(['error' => 'Unknown action'], 400);
             }
 
             return;
         }
 
         // Get available tools
-        $tools = FotoHubStabilityTools::getAvailableTools();
+        // getAvailableTools() is an instance method
+        $tools = !empty($apiKey)
+            ? (new FotoHubStabilityTools(new FotoHubApiClient($apiKey), (int) $this->context->language->id))
+                ->getAvailableTools()
+            : [];
 
         // Get product list for dropdown
         $products = Product::getProducts(
@@ -86,9 +102,52 @@ class AdminFotoHubToolsController extends ModuleAdminController
             'fotohub_tools' => $tools,
             'fotohub_products' => $productList,
             'fotohub_tools_url' => $this->context->link->getAdminLink('AdminFotoHubTools'),
+            // The AJAX endpoints verify this token explicitly (CSRF).
+            'fotohub_token' => $this->token,
+            'fotohub_can_edit' => $this->canEdit(),
+            'fotohub_drafts_url' => $this->context->link->getAdminLink('AdminFotohubDrafts'),
         ]);
 
         $this->setTemplate('tools.tpl');
+    }
+
+    /**
+     * Verify the admin CSRF token for the current request
+     */
+    private function verifyRequestToken(): bool
+    {
+        $token = Tools::getValue('token');
+
+        if (!is_string($token) || $token === '') {
+            return false;
+        }
+
+        return hash_equals((string) $this->token, $token);
+    }
+
+    /**
+     * Does the employee hold the edit permission on this controller?
+     */
+    private function canEdit(): bool
+    {
+        return (bool) Access::isGranted(
+            'ROLE_MOD_TAB_' . strtoupper($this->controller_name) . '_UPDATE',
+            $this->context->employee->id_profile
+        );
+    }
+
+    /**
+     * Emit a JSON response and stop
+     *
+     * @param array $payload Response body
+     * @param int $httpCode HTTP status code
+     */
+    private function respondJson(array $payload, int $httpCode = 200): void
+    {
+        header('Content-Type: application/json');
+        http_response_code($httpCode);
+        echo json_encode($payload);
+        exit;
     }
 
     /**
@@ -130,7 +189,7 @@ class AdminFotoHubToolsController extends ModuleAdminController
         }
 
         try {
-            $stabilityTools = new FotoHubStabilityTools($apiKey);
+            $stabilityTools = new FotoHubStabilityTools(new FotoHubApiClient($apiKey), (int) $this->context->language->id);
 
             if ($idProduct) {
                 // Process product image
@@ -155,12 +214,64 @@ class AdminFotoHubToolsController extends ModuleAdminController
                 'success' => true,
                 'result_url' => $result['image_url'] ?? null,
                 'result_base64' => $result['base64'] ?? null,
+                'draft_id' => $result['draft_id'] ?? null,
+                'drafts_url' => $this->context->link->getAdminLink('AdminFotohubDrafts'),
             ]);
         } catch (Exception $e) {
             echo json_encode(['error' => $e->getMessage()]);
         }
 
         exit;
+    }
+
+    /**
+     * AJAX: queue a processed image as a pending draft on a product.
+     *
+     * DRAFT-FIRST: this never writes to the live product. Approval in
+     * AdminFotohubDrafts is the only path from an AI result to live data.
+     */
+    public function ajaxProcessSaveToProduct(): void
+    {
+        $idProduct = (int) Tools::getValue('id_product');
+        $imageUrl = (string) Tools::getValue('image_url');
+
+        if ($idProduct <= 0 || !Validate::isUnsignedId($idProduct)) {
+            $this->respondJson(['error' => 'No product ID provided'], 400);
+        }
+
+        if ($imageUrl === '') {
+            $this->respondJson(['error' => 'No image provided'], 400);
+        }
+
+        // Only http(s) URLs and data: URIs are accepted, so a crafted value
+        // cannot turn the write-back into a local file read.
+        if (!preg_match('#^(https?://|data:image/)#i', $imageUrl)) {
+            $this->respondJson(['error' => 'Unsupported image source'], 400);
+        }
+
+        $module = Module::getInstanceByName('fotohubai');
+        $apiKey = $module->getDecryptedApiKey();
+
+        if (empty($apiKey)) {
+            $this->respondJson(['error' => 'API key not configured'], 400);
+        }
+
+        $tools = new FotoHubStabilityTools(
+            new FotoHubApiClient($apiKey),
+            (int) $this->context->language->id
+        );
+
+        $idDraft = $tools->queueResultAsDraft($idProduct, $imageUrl);
+
+        if ($idDraft <= 0) {
+            $this->respondJson(['error' => 'Could not store the draft'], 500);
+        }
+
+        $this->respondJson([
+            'success' => true,
+            'draft_id' => $idDraft,
+            'drafts_url' => $this->context->link->getAdminLink('AdminFotohubDrafts'),
+        ]);
     }
 
     /**

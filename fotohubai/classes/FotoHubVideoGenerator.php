@@ -36,7 +36,7 @@ class FotoHubVideoGenerator
      *
      * @param int $idProduct Product ID
      * @param array $options Generation options:
-     *   - model (string): Video model (default: veo-2)
+     *   - model (string): Video model (default: veo-3.1-fast-generate-001)
      *   - duration (int): Duration in seconds (default: 5)
      *   - aspect_ratio (string): Aspect ratio (e.g. '1:1', '16:9')
      * @return array Response with 'job_id' for status polling
@@ -56,7 +56,7 @@ class FotoHubVideoGenerator
         $prompt = '360 turntable rotation of product: ' . $productName;
 
         $videoOptions = [
-            'model' => $options['model'] ?? 'veo-2',
+            'model' => $options['model'] ?? 'veo-3.1-fast-generate-001',
             'duration' => $options['duration'] ?? 5,
         ];
 
@@ -76,7 +76,7 @@ class FotoHubVideoGenerator
      *
      * @param int $idProduct Product ID
      * @param array $options Generation options:
-     *   - model (string): Video model (default: veo-2)
+     *   - model (string): Video model (default: veo-3.1-fast-generate-001)
      *   - duration (int): Duration in seconds (default: 5)
      *   - aspect_ratio (string): Aspect ratio
      * @return array Response with 'job_id' for status polling
@@ -108,7 +108,7 @@ class FotoHubVideoGenerator
         }
 
         $videoOptions = [
-            'model' => $options['model'] ?? 'veo-2',
+            'model' => $options['model'] ?? 'veo-3.1-fast-generate-001',
             'duration' => $options['duration'] ?? 5,
         ];
 
@@ -257,14 +257,23 @@ class FotoHubVideoGenerator
      */
     public function getSupportedModels(): array
     {
+        // Real model IDs accepted by POST /v1/ai/generate/video — the old
+        // provider-family shorthands ("veo-2", "wan", "kling", "hailuo",
+        // "seedance") do not exist on the API and were rejected.
         return [
-            'veo-2',
-            'veo-3',
-            'wan',
-            'kling',
-            'hailuo',
-            'seedance',
+            'veo-3.1-fast-generate-001',
+            'veo-3.1-generate-001',
+            'veo-3.1-lite-generate-001',
+            'wan2.6-t2v',
+            'wan2.6-i2v',
+            'kling-v3',
+            'kling-v2-5-turbo',
+            'hailuo-2.3',
+            'hailuo-2.3-fast',
+            'seedance-2-0-pro',
+            'seedance-2-0-mini',
             'sora-2',
+            'grok-imagine-video',
         ];
     }
 
