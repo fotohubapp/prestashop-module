@@ -507,9 +507,14 @@ class FotoHubApiClient
     /**
      * Analyze an image with AI vision
      *
+     * Results come back at the top level keyed by feature name ('labels',
+     * 'objects', 'faces', 'nsfw', 'ocr', 'colors', 'landmarks', 'logos') plus a
+     * flat 'auto_tags' list. There is no 'analysis' wrapper. Only those feature
+     * names are accepted; anything else is rejected with HTTP 400.
+     *
      * @param string $imageUrl URL of the image to analyze
-     * @param array $features Features: labels, faces, nsfw, ocr, colors, objects
-     * @return array Response with 'analysis' results
+     * @param array $features Features: labels, objects, faces, nsfw, ocr, colors, landmarks, logos
+     * @return array Response with per-feature keys and 'auto_tags'
      * @throws PrestaShopException
      */
     public function analyzeImage(string $imageUrl, array $features = []): array
