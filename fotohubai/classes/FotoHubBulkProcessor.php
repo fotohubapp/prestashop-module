@@ -129,7 +129,9 @@ class FotoHubBulkProcessor
      */
     public function buildBridgeItems(array $productIds, string $kind, bool $perVariant = false): array
     {
-        $needsSourceImage = in_array($kind, ['image_edit', 'bg_remove', 'bg_replace', 'upscale', 'recolor'], true);
+        // 'tryon' belongs here too: the product photo is the garment it dresses
+        // the model photo in.
+        $needsSourceImage = in_array($kind, ['image_edit', 'bg_remove', 'bg_replace', 'upscale', 'recolor', 'tryon'], true);
         $items = [];
 
         foreach ($productIds as $idProduct) {
