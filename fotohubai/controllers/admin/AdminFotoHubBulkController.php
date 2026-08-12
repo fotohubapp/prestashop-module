@@ -449,11 +449,11 @@ class AdminFotoHubBulkController extends ModuleAdminController
                 (int) ($response['total_items'] ?? $itemCount),
                 (string) ($response['estimated_credits'] ?? '?')
             );
-        } catch (FotoHubInsufficientCreditsException $e) {
+        } catch (FotoHubInsufficientFundsException $e) {
             $this->errors[] = sprintf(
-                $this->l('Insufficient credits: %1$s required, %2$s available. Top up at fotohub.app/dashboard.'),
-                (string) $e->requiredCredits,
-                (string) $e->availableCredits
+                $this->l('Insufficient funds: $%1$s required, $%2$s available. Top up at fotohub.app/console.'),
+                number_format($e->requiredUsd, 2),
+                number_format($e->availableUsd, 2)
             );
         } catch (Exception $e) {
             $this->errors[] = $this->l('Job submission failed: ') . $e->getMessage();

@@ -825,7 +825,7 @@ class FotoHubApiClient
 
     /**
      * Make an HTTP request and return status + decoded body without throwing
-     * on 4xx (needed for structured 402 insufficient_credits handling).
+     * on 4xx (needed for structured 402 insufficient_funds handling).
      *
      * @return array{http_code: int, body: array|null}
      * @throws PrestaShopException On transport failure
@@ -910,7 +910,7 @@ class FotoHubApiClient
      * file_get_contents(), so this method must call it directly rather than
      * going through Tools::file_get_contents() — otherwise the status line is
      * invisible here and every response looks like HTTP 200, which would make
-     * the structured 402 insufficient_credits handling silently unreachable.
+     * the structured 402 insufficient_funds handling silently unreachable.
      *
      * @return array{response: string|false, http_code: int}
      */

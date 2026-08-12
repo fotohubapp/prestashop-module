@@ -230,7 +230,7 @@ class FotoHubBridgeClient extends FotoHubApiClient
      * @param string|null $presetSlug Preset slug
      * @param string|null $idempotencyKey Optional idempotency key
      * @return array {job_id, status, total_items, estimated_credits}
-     * @throws FotoHubInsufficientCreditsException On HTTP 402
+     * @throws FotoHubInsufficientFundsException On HTTP 402
      * @throws PrestaShopException On invalid kind or API errors
      */
     public function createJob(
@@ -283,9 +283,14 @@ class FotoHubBridgeClient extends FotoHubApiClient
 
         if ($response['http_code'] === 402) {
             $body = $response['body'] ?? [];
-            throw new FotoHubInsufficientCreditsException(
-                (float) ($body['required_credits'] ?? 0),
-                (float) ($body['available_credits'] ?? 0)
+            // The bridge's 402 body carries `required_usd` / `balance_usd` --
+            // `required_credits` / `available_credits` are sent as null on a
+            // current server (there is no credit unit; the API is a prepaid USD
+            // wallet), so reading only the legacy keys showed "0 required, 0
+            // available" on every real refusal.
+            throw new FotoHubInsufficientFundsException(
+                (float) ($body['required_usd'] ?? $body['required_credits'] ?? 0),
+                (float) ($body['balance_usd'] ?? $body['available_credits'] ?? 0)
             );
         }
 
@@ -597,23 +602,35 @@ class FotoHubBridgeClient extends FotoHubApiClient
 }
 
 /**
- * Thrown when the bridge rejects a job with HTTP 402 insufficient_credits.
- * Carries the structured amounts so the UI can show a precise message.
+ * Thrown when the bridge rejects a job with HTTP 402 insufficient_funds.
+ * Carries the structured USD amounts so the UI can show a precise message.
  */
-class FotoHubInsufficientCreditsException extends PrestaShopException
+class FotoHubInsufficientFundsException extends PrestaShopException
 {
-    public float $requiredCredits;
-    public float $availableCredits;
+    public float $requiredUsd;
+    public float $availableUsd;
 
-    public function __construct(float $requiredCredits, float $availableCredits)
+    public function __construct(float $requiredUsd, float $availableUsd)
     {
-        $this->requiredCredits = $requiredCredits;
-        $this->availableCredits = $availableCredits;
+        $this->requiredUsd = $requiredUsd;
+        $this->availableUsd = $availableUsd;
 
         parent::__construct(sprintf(
-            'Insufficient credits: %.1f required, %.1f available.',
-            $requiredCredits,
-            $availableCredits
+            'Insufficient funds: $%.2f required, $%.2f available.',
+            $requiredUsd,
+            $availableUsd
         ));
     }
 }
+
+/**
+ * @deprecated Renamed to {@see FotoHubInsufficientFundsException} -- the API
+ * is a prepaid USD wallet, not a credit balance. This is a `class_alias` to
+ * the SAME class (not a subclass): PHP's `catch` matches on the thrown
+ * object's actual class, and only the new class is ever thrown, so a
+ * subclass here would silently stop being caught by old code. The alias
+ * keeps an existing `catch (FotoHubInsufficientCreditsException $e)` working;
+ * read `requiredUsd`/`availableUsd` -- there is no credit unit on the caught
+ * instance.
+ */
+class_alias(FotoHubInsufficientFundsException::class, 'FotoHubInsufficientCreditsException');

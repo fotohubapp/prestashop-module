@@ -70,7 +70,7 @@ class FotoHubBulkProcessor
      * @param string|null $model Image model ID
      * @param string|null $presetSlug Preset slug
      * @return array Bridge response {job_id, status, total_items, estimated_credits}
-     * @throws FotoHubInsufficientCreditsException
+     * @throws FotoHubInsufficientFundsException
      * @throws PrestaShopException
      */
     public function submitBridgeJob(
